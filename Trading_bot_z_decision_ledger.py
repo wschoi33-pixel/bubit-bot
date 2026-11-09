@@ -461,6 +461,10 @@ class DecisionLedger:
                     _int(ind.get("judge3_prov_fake_top")),
                 ),
                 "j4": _int(ind.get("judge4_reversal_pass")),
+                "j4c": _int(ind.get("judge4_class_pass")),  # [DIV-CLASS-GATE-1109] 분류판 J4
+                "j2_old": _int(ind.get("judge2_osc_pass_old")),  # [DIV-CLASS-GATE-1109] 교체 전 J2
+                "j4_old": _int(ind.get("judge4_reversal_pass_old")),  # [DIV-CLASS-GATE-1109] 교체 전 J4
+                "div_cls": "%s/%s/%s/%s" % (_s(ind.get("div_class_shape"), 6), _s(ind.get("div_class_type"), 12), _num(ind.get("div_class_pos")), _int(ind.get("div_class_gate_on"))),  # [DIV-CLASS-GATE-1109] 모양/유형/위치/켬
                 "lane": _int(ind.get("judge_lane_authorized")),
                 # 아래 4개는 BUY 신호가 있었던 행에만 값이 있다
                 "final": _s(sind.get("strategy_judges", sind.get("judges")), 8) if sig_ok else None,

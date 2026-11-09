@@ -671,6 +671,96 @@ def _confirmed_fractal_positions(values, mode: str, k: int = 2) -> list:
         return []
 
 
+def _div_class_mw(highs, lows, closes, rsi, macd, atr, tick_fn):
+    """🔒 [DIV-CLASS-GATE-1109] 사장님 순서 : ① W 인지 M 인지 ② W 일 때만 기울기로 유형 (J2 · J4 · J4-1 · J4-2).
+
+    기준 그림 = outputs/images/다이버전스.png (Bullish = W · Bearish = M).
+    입력 = 확정봉 마지막 70 개 (highs · lows · closes · rsi · macd 같은 길이) · atr = 확정봉 ATR (가격 단위).
+    ① W = 저점 둘이 70 봉 범위 아래 1/3 · 두 번째 저점 >= 첫 저점 - 1 ATR · 넥라인 >= 두 저점 + 1 ATR ·
+         좌우 간격 3 봉 이상 · 앞 하락 다리 2 ATR 이상
+       M = 고점 둘이 위 1/3 · 높이 차 1 ATR 이하 · 지금 종가 범위 위 1/2
+    ② W 일 때 W 두 저점 a · b (그 앞 저점 c) 의 가격선 · 오실레이터선 기울기 (기존 J2 · J4 품질 조건 유지) :
+       최소 가격 차 g = max(1 틱, 0.20 x ATR) (기존 _price_quality · _pivot_gap_atr_ok 와 같은 뜻)
+       J4_2_TRIPLE = 저점 셋 c > a > b (각 차 >= 1 틱) + 같은 오실레이터가 세 저점에서 연속 상승 (RSI c < a < b 또는 MACD c < a < b)
+       J4_1_EXAG   = 두 저점 같은 높이 (차 <= 1 틱) + 오실레이터 상승 (반대 오실레이터는 내려가지 않음)
+       J4_REGULAR  = 가격 b <= a - g + 오실레이터 상승 (반대 오실레이터는 내려가지 않음 · 기존 coherence)
+       J2_HIDDEN   = 가격 b >= a + g + 오실레이터 하락 (반대 오실레이터는 올라가지 않음 · 기존 coherence)
+       W_NODIV     = W 인데 위 어느 것도 아님
+    반환 (shape, type, pos) · shape = W / M / OTHER · type 은 W 일 때만 (아니면 NONE).
+    """
+    try:
+        _h = np.asarray(highs, dtype=float)
+        _l = np.asarray(lows, dtype=float)
+        _c = np.asarray(closes, dtype=float)
+        _r = np.asarray(rsi, dtype=float)
+        _m = np.asarray(macd, dtype=float)
+        if len(_h) < 20 or not (atr and atr > 0):
+            return "OTHER", "NONE", float("nan")
+        _top, _bot = float(np.nanmax(_h)), float(np.nanmin(_l))
+        _rng = _top - _bot
+        if not (_rng > 0):
+            return "OTHER", "NONE", float("nan")
+
+        def _pos(v):
+            return (v - _bot) / _rng
+
+        _P = _confirmed_fractal_positions(_l, "LOW", 2)
+        _Q = _confirmed_fractal_positions(_h, "HIGH", 2)
+        _isW = False
+        _a = _b = -1
+        if len(_P) >= 2:
+            _a, _b = _P[-2], _P[-1]
+            if _b - _a >= 2 and _a >= 1:
+                _ni = _a + 1 + int(np.argmax(_h[_a + 1:_b]))
+                _neck = _h[_ni]
+                _pre = float(np.max(_h[:_a]))
+                _isW = bool(
+                    _pos(_l[_a]) <= 1 / 3 and _pos(_l[_b]) <= 1 / 3
+                    and _l[_b] >= _l[_a] - atr
+                    and _neck - max(_l[_a], _l[_b]) >= atr
+                    and _ni - _a >= 3 and _b - _ni >= 3
+                    and _pre - _l[_a] >= 2 * atr
+                )
+        _isM = False
+        if len(_Q) >= 2:
+            _x, _y = _Q[-2], _Q[-1]
+            _isM = bool(
+                _pos(_h[_x]) >= 2 / 3 and _pos(_h[_y]) >= 2 / 3
+                and abs(_h[_y] - _h[_x]) <= atr and _pos(_c[-1]) >= 0.5
+            )
+        _shape = "M" if _isM else ("W" if _isW else "OTHER")
+        if _shape != "W":
+            return _shape, "NONE", float(_pos(_c[-1]))
+        if not all(np.isfinite(v) for v in (_r[_a], _r[_b], _m[_a], _m[_b])):
+            return _shape, "W_NODIV", float(_pos(_c[-1]))
+        _p1, _p2 = _l[_a], _l[_b]
+        _tk = max(float(tick_fn(_p1) or 0.0), float(tick_fn(_p2) or 0.0))
+        _g = max(_tk, 0.20 * float(atr))
+        _up_coh = bool((_r[_b] > _r[_a] and _m[_b] >= _m[_a]) or (_m[_b] > _m[_a] and _r[_b] >= _r[_a]))
+        _dn_coh = bool((_r[_b] < _r[_a] and _m[_b] <= _m[_a]) or (_m[_b] < _m[_a] and _r[_b] <= _r[_a]))
+        _triple = False
+        if len(_P) >= 3:
+            _k = _P[-3]
+            if np.isfinite(_r[_k]) and np.isfinite(_m[_k]):
+                _triple = bool(
+                    _l[_k] - _p1 >= _tk and _p1 - _p2 >= _tk
+                    and ((_r[_k] < _r[_a] < _r[_b]) or (_m[_k] < _m[_a] < _m[_b]))
+                )
+        if _triple:
+            _typ = "J4_2_TRIPLE"
+        elif abs(_p2 - _p1) <= _tk + 1e-12 and _up_coh:
+            _typ = "J4_1_EXAG"
+        elif _p2 <= _p1 - _g + 1e-12 and _up_coh:
+            _typ = "J4_REGULAR"
+        elif _p2 >= _p1 + _g - 1e-12 and _dn_coh:
+            _typ = "J2_HIDDEN"
+        else:
+            _typ = "W_NODIV"
+        return _shape, _typ, float(_pos(_c[-1]))
+    except Exception:
+        return "ERR", "ERR", float("nan")
+
+
 def _adaptive_tlc_swing_pivots(highs, lows, closes, atr_closed):
     """Directional-Change 기반 능동형 swing pivot.
 
@@ -4613,6 +4703,25 @@ class TechnicalIndicators:
             # TLC가 아직 계산 전이므로 결합값은 FINAL 블록에서만 확정한다.
             indicators["divergence_hidden_bull"] = False
             indicators["divergence_bear_reg_valid"] = _bear_valid_raw
+            # 🔒 [DIV-CLASS-GATE-1109] ① W / M ② W 일 때 기울기로 유형 (J2 / J4 / J4-1 / J4-2) · 표 교체는 6_strategy J2 입구
+            try:
+                _dc_closed = df.iloc[:-1].tail(70)
+                _dc_rsi = _rsi_series.reindex(_dc_closed.index).to_numpy(dtype=float)
+                _dc_macd = (
+                    _macd_series.reindex(_dc_closed.index)
+                    / _dc_closed["close"].astype(float) * 100.0
+                ).to_numpy(dtype=float)
+                _dc_s, _dc_t, _dc_p = _div_class_mw(
+                    _dc_closed["high"].to_numpy(dtype=float),
+                    _dc_closed["low"].to_numpy(dtype=float),
+                    _dc_closed["close"].to_numpy(dtype=float),
+                    _dc_rsi, _dc_macd, float(_div_atr_raw or 0.0), get_tick_size,
+                )
+            except Exception:
+                _dc_s, _dc_t, _dc_p = "ERR", "ERR", float("nan")
+            indicators["div_class_shape"] = _dc_s
+            indicators["div_class_type"] = _dc_t
+            indicators["div_class_pos"] = _dc_p
 
             # 동시 발생 시 가자미근 후보인 히든상승 품질값을 우선 기록한다.
             if _hidden_raw:
@@ -14403,9 +14512,25 @@ class TechnicalIndicators:
                                 and not bool(int(indicators.get("gajami_fake_late_reset_gc", 0) or 0))
                                 and not _j2_bear_raw
                             )
-                            indicators["judge4_reversal_pass"] = int(
+                            iindicators["judge4_reversal_pass"] = int(
                                 _judge4_reversal_pass
                             )
+                            # 🔒 [DIV-CLASS-GATE-1109] 분류판 J4 = 위 J4 와 같은 조건에서 「일반 다이버전스」 자리만 「W ∧ (J4 일반 · J4-1 과장 · J4-2 트리플)」
+                            # 실제 표 교체 = 6_strategy J2 입구 (config [DIVERGENCE] div_class_gate · 기본 켬)
+                            _dcg_j4 = bool(
+                                str(indicators.get("div_class_shape", "")) == "W"
+                                and str(indicators.get("div_class_type", "")) in ("J4_REGULAR", "J4_1_EXAG", "J4_2_TRIPLE")
+                            )
+                            _judge4_class_pass = bool(
+                                _j2_ready
+                                and _j2_div_ready
+                                and _dcg_j4
+                                and _j4_macd_below_zero
+                                and _j4_reversal_candle_event
+                                and not bool(int(indicators.get("gajami_fake_late_reset_gc", 0) or 0))
+                                and not _j2_bear_raw
+                            )
+                            indicators["judge4_class_pass"] = int(_judge4_class_pass)
                             # ── KC setup SHADOW + J3×J2 활성 진입 SSoT ──
                             # raw KC setup 값은 로그·indicators 관측만 유지하고, 진입 승인에는 사용하지 않는다.
                             _coil_s5_closed_pct = safe_extract_scalar(

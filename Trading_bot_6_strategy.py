@@ -2575,6 +2575,33 @@ class SignalAnalyzer:
             indicators["judge2_osc_pass_raw"] = int(_j2_ingress_raw)
             indicators["judge2_osc_verdict_raw"] = _j2_ingress_verdict
             indicators["judge2_osc_pass"] = int(_j2_ingress_effective)
+            # 🔒 [DIV-CLASS-GATE-1109] 사장님 「① W / M ② W 일 때 기울기로 J2 · J4 · J4-1 · J4-2 · 곧바로 적용」
+            # 입구에서 한 번만 교체 → 뒤의 모든 소비처 (헌법 구제 _gajami_core_ok · 생애 구제 · 최종 표 · 7_bot) 가 같은 표를 봄
+            # J2 = 기존 effective ∧ W ∧ J2 히든 · J4 = judge4_class_pass (W ∧ J4 일반 · J4-1 과장 · J4-2 트리플) · M · 기타 · 오류 · 분류 없음 = 표 없음
+            # 끄기 = config.ini [DIVERGENCE] div_class_gate = false (옛 표 그대로)
+            indicators["judge2_osc_pass_old"] = int(_j2_ingress_effective)
+            indicators["judge4_reversal_pass_old"] = int(indicators.get("judge4_reversal_pass", 0) or 0)
+            indicators["div_class_gate_on"] = 0
+            if bool(self.config.getboolean("DIVERGENCE", "div_class_gate", fallback=True)):
+                _dcg_shape = str(indicators.get("div_class_shape", ""))
+                _dcg_type = str(indicators.get("div_class_type", ""))
+                _dcg_j2_new = int(bool(_j2_ingress_effective) and _dcg_shape == "W" and _dcg_type == "J2_HIDDEN")
+                _dcg_j4_new = int(int(indicators.get("judge4_class_pass", 0) or 0) == 1)
+                indicators["judge2_osc_pass"] = _dcg_j2_new
+                indicators["judge4_reversal_pass"] = _dcg_j4_new
+                indicators["div_class_gate_on"] = 1
+                # J2 직행 (L2619 · 기본 꺼짐) 도 분류 표를 우회하지 못하게 같은 값 (Fable R1333)
+                _j2_ingress_effective = bool(_dcg_j2_new)
+                if (
+                    _dcg_j2_new != indicators["judge2_osc_pass_old"]
+                    or _dcg_j4_new != indicators["judge4_reversal_pass_old"]
+                ):
+                    logger.info(
+                        f"🧭 [DIV-CLASS-GATE] {symbol} 표 바뀜 | "
+                        f"J2 {indicators['judge2_osc_pass_old']}→{_dcg_j2_new} "
+                        f"J4 {indicators['judge4_reversal_pass_old']}→{_dcg_j4_new} | "
+                        f"모양={_dcg_shape or 'NA'} 유형={_dcg_type or 'NA'}"
+                    )
             if (_j2_ingress_raw or _j2_ingress_prov_pass):
                 if _j2_ingress_prov_ok:
                     # 🔒 [J2-INGRESS-POSITIVE-OBSERVE-0902] ★482-R1

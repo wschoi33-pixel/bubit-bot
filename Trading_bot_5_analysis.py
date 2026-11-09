@@ -14512,7 +14512,7 @@ class TechnicalIndicators:
                                 and not bool(int(indicators.get("gajami_fake_late_reset_gc", 0) or 0))
                                 and not _j2_bear_raw
                             )
-                            iindicators["judge4_reversal_pass"] = int(
+                            indicators["judge4_reversal_pass"] = int(
                                 _judge4_reversal_pass
                             )
                             # 🔒 [DIV-CLASS-GATE-1109] 분류판 J4 = 위 J4 와 같은 조건에서 「일반 다이버전스」 자리만 「W ∧ (J4 일반 · J4-1 과장 · J4-2 트리플)」

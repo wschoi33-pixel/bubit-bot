@@ -748,10 +748,10 @@ def _div_class_mw(highs, lows, closes, rsi, macd, atr, tick_fn):
                 )
         if _triple:
             _typ = "J4_2_TRIPLE"
-        elif abs(_p2 - _p1) <= _tk + 1e-12 and _up_coh:
-            _typ = "J4_1_EXAG"
         elif _p2 <= _p1 - _g + 1e-12 and _up_coh:
             _typ = "J4_REGULAR"
+        elif abs(_p2 - _p1) <= _tk + 1e-12 and _up_coh:
+            _typ = "J4_1_EXAG"
         elif _p2 >= _p1 + _g - 1e-12 and _dn_coh:
             _typ = "J2_HIDDEN"
         else:

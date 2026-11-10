@@ -5573,7 +5573,7 @@ class TechnicalIndicators:
         # - 예: 05:27:00 시작 3분봉 → 05:30:00까지 미완성
         # ============================================================
         
-        candle_end_ts = last_ts.timestamp() + timeframe_sec
+        candle_end_ts = (last_ts.tz_localize("Asia/Seoul") if getattr(last_ts, "tzinfo", None) is None else last_ts).timestamp() + timeframe_sec
         
         # 현재 시각이 캔들 종료 시각보다 이전이면 미완성
         if now_ts < candle_end_ts:

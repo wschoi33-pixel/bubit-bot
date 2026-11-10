@@ -1401,7 +1401,7 @@ class WebSocketManager:
             idx = df.index[-1]
             
             # 🔥 캔들 경계 체크 (타임프레임 자동, 3m 하드코딩 제거)
-            candle_ts = int(idx.timestamp())
+            candle_ts = int((idx.tz_localize("Asia/Seoul") if getattr(idx, "tzinfo", None) is None else idx).timestamp())
             now_ts = int(time.time())
             
             # config 기반 timeframe → seconds 매핑

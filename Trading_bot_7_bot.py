@@ -5694,7 +5694,7 @@ class UnifiedTradingBot:
             # 확정봉은 REST 권위. ticker는 현재 형성봉에만 적용한다.
             try:
                 _tf_sec = self._timeframe_to_seconds(self.timeframe.value)
-                _bar_ts = int(idx.timestamp()) if hasattr(idx, "timestamp") else None
+                _bar_ts = int((idx.tz_localize("Asia/Seoul") if getattr(idx, "tzinfo", None) is None else idx).timestamp()) if hasattr(idx, "timestamp") else None
                 if _bar_ts is None:
                     return
                 if (int(time.time()) - _bar_ts) >= _tf_sec:

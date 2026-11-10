@@ -3160,6 +3160,15 @@ class TechnicalIndicators:
         
         indicators = {}
         indicators["symbol"] = symbol
+        # 🔧 [DL-OHLCV-1110-v2] 지표 계산 직전 df 마지막 6 봉 (시각 · 시 · 고 · 저 · 종 · 거래량) 을 그 자리에서 고정 → 결정 원장 관측 전용 · 판단 불변
+        try:
+            _dl_k = min(6, len(df))
+            indicators["_dl_ohlcv6"] = {
+                "t": [str(_x)[:19] for _x in df.index[-_dl_k:]],
+                "v": [[(round(float(_x), 10) if math.isfinite(float(_x)) else None) for _x in _r] for _r in df[["open", "high", "low", "close", "volume"]].iloc[-_dl_k:].to_numpy()],
+            }
+        except Exception:
+            pass
         # 🔒 [2026-08-21] candle_dense_ok / _reason / _density_hard_block 3키 ★제거 (소비처 0곳).
         #  밀도 판정은 t5 내부 `_dense_ok` 로 계속 수행되며 t7 CACHE-REST-REPAIR 경로도 영향 없다.
         

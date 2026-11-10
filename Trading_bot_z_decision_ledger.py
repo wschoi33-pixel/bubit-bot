@@ -621,6 +621,7 @@ class DecisionLedger:
         out = {
             "last": None, "prev": None, "n": None, "last_age_s": None,
             "shadow": _s(ind.get("indicator_shadow_bar"), 20), "tail": [],
+            "ohlcv": None,
         }
         try:
             if df is None:
@@ -640,6 +641,13 @@ class DecisionLedger:
             if n >= 2:
                 out["prev"] = str(idx[-2])[:19]
             out["tail"] = [str(idx[-i])[:19] for i in range(min(8, n), 0, -1)]
+            # 🔧 [DL-OHLCV-1110-v2] 지표 계산 때 고정한 6 봉 (5_analysis indicators["_dl_ohlcv6"]) 만 기록 · df 다시 안 읽음 · 관측 전용
+            try:
+                _dlo = ind.get("_dl_ohlcv6") if isinstance(ind, dict) else None
+                if isinstance(_dlo, dict) and _dlo.get("v"):
+                    out["ohlcv"] = _dlo
+            except Exception:
+                pass
         except Exception:
             self.n_err += 1
         return out

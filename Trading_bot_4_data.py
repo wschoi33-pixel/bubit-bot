@@ -1878,6 +1878,10 @@ class DataManager:
         if self.ws_manager and self.ws_manager.is_healthy():
             ticker = self.ws_manager.ticker_cache.get(market)
             if ticker:
+                # [STALEPX] 구독에서 빠진 종목의 옛 시세가 캐시에 남음 → 3 초 넘은 시세는 버림 (get_current_price · RT-HARDSTOP 과 같은 기준)
+                _age = (time.time() * 1000 - float(ticker.get('timestamp', 0) or 0)) / 1000
+                if _age > 3:
+                    return None
                 return ticker.get('trade_price')
         return None
     

@@ -1281,7 +1281,7 @@ class SimulationExecutionEngine(ExecutionEngine):
                     old_holdings = self.holdings[request.symbol]
                     self.holdings[request.symbol] -= response.executed_volume
                     
-                    if self.holdings[request.symbol] == 0:
+                    if round(self.holdings[request.symbol], 8) <= 0:  # [SIMDUST] SIM 보유 장부의 소수점 먼지도 정리
                         del self.holdings[request.symbol]
                     
                     # ========================================
@@ -1368,7 +1368,7 @@ class SimulationExecutionEngine(ExecutionEngine):
         """시뮬레이션 리셋"""
         self.balance = initial_balance or self.initial_balance
         self.holdings.clear()
-        self.order_history.clear()
+        self
         logger.info(f"시뮬레이션 리셋 (잔고: {self.balance:,.0f}원)")
 
 class ExecutionEngineFactory:

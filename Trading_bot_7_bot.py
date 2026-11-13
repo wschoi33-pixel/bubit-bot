@@ -5276,7 +5276,7 @@ class UnifiedTradingBot:
         )
         _full_exit = (
             _real_remaining_q8(position.volume, response.executed_volume) <= 0  # [보완 v3_4 G6] 거래소 수량 단위 1e-8 · 잔량 계산 · 0 판정과 같은 함수
-            if self.mode == 'real' else position.volume - float(response.executed_volume) == 0
+            if self.mode == 'real' else round(position.volume - float(response.executed_volume), 8) <= 0  # [SIMDUST] SIM 1e-8 잔량은 보존
         )
         
         if hasattr(signal, 'metadata') and signal.metadata:
@@ -5468,7 +5468,7 @@ class UnifiedTradingBot:
                     position.volume = new_volume
                 
                 # 🆕 포지션 volume이 0이면 명시적으로 삭제 (유령 포지션 방지!)
-                if (_real_remaining_q8(position.volume, 0.0) <= 0) if self.mode == 'real' else (position.volume == 0):  # SIM 양수 잔량 보존
+                if (_real_remaining_q8(position.volume, 0.0) <= 0) if self.mode == 'real' else (round(position.volume, 8) <= 0):  # [SIMDUST] SIM 소수점 8자리에서 0인 먼지만 정리
                     logger.info(f"✅ {position.symbol} 포지션 완전 청산 (volume=0) - 삭제")
                     
                     # 🔒 PRE 탐색 실패 시 동일 파동 쿨다운

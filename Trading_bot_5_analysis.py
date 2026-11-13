@@ -14634,6 +14634,7 @@ class TechnicalIndicators:
                             )
                             _j4_reversal_candle_event = bool(
                                 indicators.get("cycle_reversal_candle_bull", False)
+                                or indicators.get("_fix_j4_rev_win", False)
                             )
                             _judge4_reversal_pass = bool(
                                 _j2_ready
@@ -14659,7 +14660,10 @@ class TechnicalIndicators:
                                 and _j2_div_ready
                                 and _dcg_j4
                                 and _j4_macd_below_zero
-                                and _j4_reversal_candle_event
+                                and bool(
+                                    indicators.get("cycle_reversal_candle_bull", False)
+                                    or indicators.get("_fix_j4_class_rev_win", False)
+                                )
                                 and not bool(int(indicators.get("gajami_fake_late_reset_gc", 0) or 0))
                                 and not _j2_bear_raw
                                 and not bool(indicators.get("div_class_invalid", False))
@@ -20177,4 +20181,4 @@ class MarketAnalyzer:
             logger.error(f"시장 요약 오류: {e}")
             return {}
         
-# **END**        
+# **END**

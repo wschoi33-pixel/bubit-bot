@@ -5165,7 +5165,8 @@ class UnifiedTradingBot:
             side="sell",
             executed_volume=response.executed_volume,
             avg_price=response.executed_price,
-            total_fee=response.fee
+            total_fee=response.fee,
+            slippage_pct=getattr(response, "slippage_pct", 0.0) or 0.0   # [SELLSLIP 11-14] 매도 미끄러짐 DB 전달 (전엔 빠져 0 기록)
         )
         
         # ========================================
@@ -7306,8 +7307,17 @@ class UnifiedTradingBot:
                     logger.info("📊 최종 성과")
                     logger.info("=" * 60)
                     logger.info(f"초기 자산: {self.initial_balance:,.0f}원")
-                    logger.info(f"최종 자산: {balance:,.0f}원")
-                    logger.info("수익률: %+.2f%%", returns)
+                    logger.info(f"최종 현금 (보유 평가 제외): {balance:,.0f}원")
+                    logger.info("현금 수익률 (보유 평가 제외): %+.2f%%", returns)
+                    # [SIMEXIT-DISPLAY] 위 = 현금만 · 아래 = 참고 평가 (보유 × 마지막 WS 시세 · 없으면 매수가 · 시세 나이 검사 없음 · 정산 값 아님) · 매매 동작 불변
+                    try:
+                        if self.mode == 'real': raise RuntimeError('SIM 전용')   # [v1_2] 참고 평가 = SIM 전용 (REAL 은 거래소 잔고가 정산 기준)
+                        _tc = getattr(getattr(getattr(self, 'data_manager', None), 'ws_manager', None), 'ticker_cache', None) or {}
+                        _hv = sum(float(p.volume) * float((_tc.get(s) or {}).get('trade_price') or p.avg_price) for s, p in list(self.positions.items()))
+                        _tv = balance + _hv
+                        logger.info("[참고 평가] 보유 %d 종 %s원 · 현금 + 보유 %s원 · 수익률 %+.2f%% (마지막 시세 · 없으면 매수가)", len(self.positions), f"{_hv:,.0f}", f"{_tv:,.0f}", ((_tv - self.initial_balance) / self.initial_balance * 100) if self.initial_balance > 0 else 0)
+                    except Exception as _sx_e:
+                        logger.debug(f"[SIMEXIT-DISPLAY] 참고 평가 실패: {_sx_e}")
                     logger.info(f"실행 시간: {runtime}")
                     logger.info(f"총 거래: {len(self.daily_trades)}건")
                     

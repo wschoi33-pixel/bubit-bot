@@ -671,6 +671,81 @@ def _confirmed_fractal_positions(values, mode: str, k: int = 2) -> list:
         return []
 
 
+def _divergence_closed_selection(index, timeframe, now_ts=None):
+    """Return a shared slice/position for the latest completed indicator bar.
+
+    A quiet market may have no row for the forming candle. Preserve its last
+    completed row instead of blindly discarding it. Unknown timestamps or
+    timeframes retain the existing conservative last-row exclusion.
+    """
+    try:
+        if not isinstance(index, pd.DatetimeIndex) or not len(index):
+            return -1, -2
+        tf = str(getattr(timeframe, "value", timeframe)).strip().lower()
+        seconds = {
+            "1m": 60, "3m": 180, "5m": 300, "10m": 600,
+            "15m": 900, "30m": 1800, "1h": 3600,
+            "4h": 14400, "1d": 86400,
+        }[tf]
+        last = pd.Timestamp(index[-1])
+        if pd.isna(last):
+            return -1, -2
+        if last.tzinfo is None:
+            last = last.tz_localize("Asia/Seoul")
+        if now_ts is None:
+            import time
+            now_ts = time.time()
+        now_ts = float(now_ts)
+        if math.isfinite(now_ts) and last.timestamp() + seconds <= now_ts:
+            return None, -1
+    except (KeyError, TypeError, ValueError, OverflowError):
+        pass
+    return -1, -2
+
+
+def _bullish_divergence_pair_context(highs, lows, closes, opens=None, k=2):
+    """같은 확정 저점쌍의 무효화와 L2·L2+1·확정봉 반전캔들.
+
+    입력은 확정봉만 사용한다. 저점 확정까지 기다리는 동안 지나간
+    장악형/양봉 망치형도 기존 반전캔들 정의로 확인한다.
+    창은 최신 쌍 교체 또는 L2 종가 무효화 전까지 승인 근거로 보존한다.
+    기존 연구 정의에 없는 임의의 1봉 재사용 기한은 추가하지 않는다.
+    """
+    try:
+        _h, _l, _c = (np.asarray(v, dtype=float) for v in (highs, lows, closes))
+        if not (len(_h) == len(_l) == len(_c)):
+            return False, False
+        _pivots = _confirmed_fractal_positions(_l, "LOW", k)
+        if len(_pivots) < 2:
+            return False, False
+        _l2 = _pivots[-1]
+        _invalid = bool(np.any(_c[_l2 + 1:] < _l[_l2]))
+        if opens is None:
+            return _invalid, False
+        _o = np.asarray(opens, dtype=float)
+        if len(_o) != len(_c):
+            return _invalid, False
+        _reversal = False
+        for _i in (_l2, _l2 + 1, _l2 + int(k)):
+            if not 1 <= _i < len(_c):
+                continue
+            _po, _pc = _o[_i - 1], _c[_i - 1]
+            _co, _ch, _cl, _cc = _o[_i], _h[_i], _l[_i], _c[_i]
+            if not all(math.isfinite(v) for v in (_po, _pc, _co, _ch, _cl, _cc)):
+                continue
+            _engulf = bool(_pc < _po and _cc > _co and _co <= _pc and _cc >= _po)
+            _body = abs(_cc - _co)
+            _hammer = bool(
+                _body > 0.0 and _cc > _co
+                and min(_co, _cc) - _cl >= 2.0 * _body
+                and _ch - max(_co, _cc) <= _body
+            )
+            _reversal = bool(_reversal or _engulf or _hammer)
+        return _invalid, _reversal
+    except Exception:
+        return False, False
+
+
 def _div_class_mw(highs, lows, closes, rsi, macd, atr, tick_fn):
     """🔒 [DIV-CLASS-GATE-1109] 사장님 순서 : ① W 인지 M 인지 ② W 일 때만 기울기로 유형 (J2 · J4 · J4-1 · J4-2).
 
@@ -3903,18 +3978,20 @@ class TechnicalIndicators:
             _macd_signal_period = 9
             _shadow_min_bars = _macd_slow + _macd_signal_period
 
-            if df is None or len(df) < (_shadow_min_bars + 1):
+            if df is None or len(df) < _shadow_min_bars:
                 raise ValueError(
                     f"CLOSED_DATA_SHORT({0 if df is None else len(df)}"
-                    f"<{_shadow_min_bars + 1})"
+                    f"<{_shadow_min_bars})"
                 )
 
-            # 현재 진행봉 iloc[-1] 제외.
-            # 모든 지표·bar·px를 직전 확정봉 iloc[-2]에 고정한다.
+            # All shared indicators must select the same completed candle.
+            # A missing forming row does not make the last completed row stale.
+            _sh_cut, _sh_pos = _divergence_closed_selection(df.index, timeframe)
+            indicators["shadow_last_row_closed"] = bool(_sh_cut is None)
             _shadow_close = (
                 df["close"]
                 .astype(float)
-                .iloc[:-1]
+                .iloc[:_sh_cut]
                 .replace([np.inf, -np.inf], np.nan)
                 .dropna()
             )
@@ -3925,15 +4002,15 @@ class TechnicalIndicators:
                     f"<{_shadow_min_bars})"
                 )
 
-            _shadow_px = float(df["close"].astype(float).iloc[-2])
+            _shadow_px = float(df["close"].astype(float).iloc[_sh_pos])
 
             if not math.isfinite(_shadow_px) or _shadow_px <= 0.0:
                 raise ValueError(f"CLOSED_PX_INVALID({_shadow_px})")
 
             try:
-                _shadow_bar = df.index[-2].isoformat()
+                _shadow_bar = df.index[_sh_pos].isoformat()
             except Exception:
-                _shadow_bar = str(df.index[-2])
+                _shadow_bar = str(df.index[_sh_pos])
 
             # 1) Bollinger Bands(20,2) — 확정봉 종가 기준
             _bb_close = _shadow_close.tail(_bb_win)
@@ -3990,10 +4067,10 @@ class TechnicalIndicators:
             _kc_squeeze_on = False
             try:
                 _shadow_high = (
-                    df["high"].astype(float).iloc[:-1].reindex(_shadow_close.index)
+                    df["high"].astype(float).iloc[:_sh_cut].reindex(_shadow_close.index)
                 )
                 _shadow_low = (
-                    df["low"].astype(float).iloc[:-1].reindex(_shadow_close.index)
+                    df["low"].astype(float).iloc[:_sh_cut].reindex(_shadow_close.index)
                 )
                 _shadow_prev_close = _shadow_close.shift(1)
                 _kc_tr = pd.concat(
@@ -4293,6 +4370,7 @@ class TechnicalIndicators:
             indicators["macd_hist_prev"] = _macd_hist_prev
             indicators["indicator_shadow_bar"] = _shadow_bar
             indicators["indicator_shadow_px"] = _shadow_px
+            indicators["indicator_shadow_source_last"] = str(df.index[-1])
 
             # 같은 심볼·TF·확정봉은 한 번만 INFO 로그로 적재한다.
             _shadow_tf = (
@@ -4361,6 +4439,10 @@ class TechnicalIndicators:
         indicators.setdefault("divergence_reg_pivot_bar", "NA")
         indicators.setdefault("divergence_reg_confirm_bar", "NA")
         indicators.setdefault("div_j2_hidden_coherent", False)
+        indicators["div_invalid"] = False
+        indicators["_fix_j4_rev_win"] = False
+        indicators["div_class_invalid"] = False
+        indicators["_fix_j4_class_rev_win"] = False
         indicators.setdefault("divergence_hidden_bull", False)
         indicators.setdefault("divergence_bear_reg_valid", False)
         indicators.setdefault("divergence_price_delta_pct", 0.0)
@@ -4423,13 +4505,13 @@ class TechnicalIndicators:
                     "high": (
                         df["high"]
                         .astype(float)
-                        .iloc[:-1]
+                        .iloc[:_sh_cut]
                         .reindex(_div_close.index)
                     ),
                     "low": (
                         df["low"]
                         .astype(float)
-                        .iloc[:-1]
+                        .iloc[:_sh_cut]
                         .reindex(_div_close.index)
                     ),
                     "rsi": _rsi_series.reindex(_div_close.index),
@@ -4467,9 +4549,14 @@ class TechnicalIndicators:
             # divergence 확정창과 같은 최근 최대 35개 확정 ATR의 중앙값을 사용한다.
             # 5개 이상이면 중앙값, 그 미만에서만 기존 직전 확정봉 ATR로 폴백한다.
             try:
-                _div_atr_series = indicators.get("atr")
+                # calculate_atr filters its entire history against the last close.
+                # Calculate on completed OHLC so a forming price cannot alter
+                # the confirmed divergence floor or W/M classification.
+                _div_atr_series = TechnicalIndicators.calculate_atr(
+                    df.iloc[:_sh_cut], atr_min_pct=_atr_min,
+                )
                 _div_atr_win = (
-                    _div_atr_series.iloc[:-1].tail(_div_lookback)
+                    _div_atr_series.tail(_div_lookback)
                     if hasattr(_div_atr_series, "iloc")
                     and len(_div_atr_series) >= 2
                     else None
@@ -4480,7 +4567,7 @@ class TechnicalIndicators:
                     hasattr(_div_atr_series, "iloc")
                     and len(_div_atr_series) >= 2
                 ):
-                    _div_atr_raw = float(_div_atr_series.iloc[-2])
+                    _div_atr_raw = float(_div_atr_series.iloc[-1])
                 else:
                     _div_atr_raw = 0.0
             except Exception:
@@ -4572,6 +4659,17 @@ class TechnicalIndicators:
                     )
 
             _lows = _fractal_positions("low", "LOW")
+            (
+                indicators["div_invalid"],
+                indicators["_fix_j4_rev_win"],
+            ) = _bullish_divergence_pair_context(
+                _div_frame["high"].to_numpy(dtype=float),
+                _div_frame["low"].to_numpy(dtype=float),
+                _div_close.reindex(_div_frame.index).to_numpy(dtype=float),
+                df["open"].reindex(_div_frame.index).to_numpy(dtype=float)
+                if "open" in df.columns else None,
+                k=_div_k,
+            )
             if len(_lows) >= 2:
                 _l1, _l2 = _lows[-2], _lows[-1]
                 _pl1 = float(_div_frame["low"].iloc[_l1])
@@ -4714,7 +4812,7 @@ class TechnicalIndicators:
             indicators["divergence_bear_reg_valid"] = _bear_valid_raw
             # 🔒 [DIV-CLASS-GATE-1109] ① W / M ② W 일 때 기울기로 유형 (J2 / J4 / J4-1 / J4-2) · 표 교체는 6_strategy J2 입구
             try:
-                _dc_closed = df.iloc[:-1].tail(70)
+                _dc_closed = df.iloc[:_sh_cut].tail(70)
                 _dc_rsi = _rsi_series.reindex(_dc_closed.index).to_numpy(dtype=float)
                 _dc_macd = (
                     _macd_series.reindex(_dc_closed.index)
@@ -4725,6 +4823,17 @@ class TechnicalIndicators:
                     _dc_closed["low"].to_numpy(dtype=float),
                     _dc_closed["close"].to_numpy(dtype=float),
                     _dc_rsi, _dc_macd, float(_div_atr_raw or 0.0), get_tick_size,
+                )
+                (
+                    indicators["div_class_invalid"],
+                    indicators["_fix_j4_class_rev_win"],
+                ) = _bullish_divergence_pair_context(
+                    _dc_closed["high"].to_numpy(dtype=float),
+                    _dc_closed["low"].to_numpy(dtype=float),
+                    _dc_closed["close"].to_numpy(dtype=float),
+                    _dc_closed["open"].to_numpy(dtype=float)
+                    if "open" in _dc_closed.columns else None,
+                    k=_div_k,
                 )
             except Exception:
                 _dc_s, _dc_t, _dc_p = "ERR", "ERR", float("nan")
@@ -12865,12 +12974,25 @@ class TechnicalIndicators:
                                     "CYCLE_INPUT_SHORT_OR_MISSING"
                                 )
 
-                            # 현재 진행봉 제외 — 확정봉 시계열로 고정.
+                            # Shared BB/KC/divergence and cycle use the same
+                            # completed-bar rule, including quiet markets.
+                            if indicators.get("indicator_shadow_source_last") == str(df.index[-1]):
+                                # Preserve the indicator snapshot if this call
+                                # crosses a candle-close boundary.
+                                _cycle_cut, _cycle_pos = (
+                                    (None, -1)
+                                    if indicators.get("shadow_last_row_closed", False)
+                                    else (-1, -2)
+                                )
+                            else:
+                                _cycle_cut, _cycle_pos = _divergence_closed_selection(
+                                    df.index, timeframe,
+                                )
                             _cycle_close = (
-                                df["close"].astype(float).iloc[:-1]
+                                df["close"].astype(float).iloc[:_cycle_cut]
                             )
                             _cycle_volume = (
-                                df["volume"].astype(float).iloc[:-1]
+                                df["volume"].astype(float).iloc[:_cycle_cut]
                             )
 
                             # 1) bandwidth 추이 — BB(20,2) 확정봉, 직전 1봉 대비
@@ -12981,13 +13103,13 @@ class TechnicalIndicators:
                                 else 0.0
                             )
 
-                            # 4) 반전캔들 — 직전 확정봉 2개(iloc[-3],iloc[-2])
-                            _po = float(df["open"].iloc[-3])
-                            _pc = float(df["close"].iloc[-3])
-                            _o = float(df["open"].iloc[-2])
-                            _h = float(df["high"].iloc[-2])
-                            _l = float(df["low"].iloc[-2])
-                            _c = float(df["close"].iloc[-2])
+                            # 4) 반전캔들 — 같은 시계열의 마지막 확정봉 2개.
+                            _po = float(df["open"].iloc[_cycle_pos - 1])
+                            _pc = float(df["close"].iloc[_cycle_pos - 1])
+                            _o = float(df["open"].iloc[_cycle_pos])
+                            _h = float(df["high"].iloc[_cycle_pos])
+                            _l = float(df["low"].iloc[_cycle_pos])
+                            _c = float(df["close"].iloc[_cycle_pos])
 
                             _bull_engulf = bool(
                                 _pc < _po
@@ -13027,7 +13149,7 @@ class TechnicalIndicators:
                             )
 
                             # 5) ADX — 기존 계산값(indicators['adx']) 재사용,
-                            #    확정봉 2개(iloc[-3],iloc[-2])만 사용.
+                            #    위와 같은 마지막 확정봉 2개만 사용.
                             _adx_series = indicators.get("adx")
                             if (
                                 not hasattr(_adx_series, "iloc")
@@ -13035,8 +13157,8 @@ class TechnicalIndicators:
                             ):
                                 raise ValueError("CYCLE_ADX_MISSING")
 
-                            _adx_prev = float(_adx_series.iloc[-3])
-                            _adx_closed = float(_adx_series.iloc[-2])
+                            _adx_prev = float(_adx_series.iloc[_cycle_pos - 1])
+                            _adx_closed = float(_adx_series.iloc[_cycle_pos])
 
                             if not (
                                 math.isfinite(_adx_prev)
@@ -14480,6 +14602,7 @@ class TechnicalIndicators:
                                 and not _j2_overheat
                                 and not bool(int(indicators.get(
                                     "gajami_ranging_ma20_collapse_block", 0) or 0))
+                                and not bool(indicators.get("div_invalid", False))
                             )
                             _j2_momentum_go = bool(
                                 _j2_ready
@@ -14520,6 +14643,7 @@ class TechnicalIndicators:
                                 and _j4_reversal_candle_event
                                 and not bool(int(indicators.get("gajami_fake_late_reset_gc", 0) or 0))
                                 and not _j2_bear_raw
+                                and not bool(indicators.get("div_invalid", False))
                             )
                             indicators["judge4_reversal_pass"] = int(
                                 _judge4_reversal_pass
@@ -14538,6 +14662,7 @@ class TechnicalIndicators:
                                 and _j4_reversal_candle_event
                                 and not bool(int(indicators.get("gajami_fake_late_reset_gc", 0) or 0))
                                 and not _j2_bear_raw
+                                and not bool(indicators.get("div_class_invalid", False))
                             )
                             indicators["judge4_class_pass"] = int(_judge4_class_pass)
                             # ── KC setup SHADOW + J3×J2 활성 진입 SSoT ──

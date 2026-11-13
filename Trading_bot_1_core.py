@@ -672,6 +672,7 @@ class ExecutionResult:
     error: str = ""
     avg_price: float = 0
     total_fee: float = 0
+    slippage_pct: float = 0.0   # [SELLSLIP 11-14] 매도 응답 미끄러짐 (%) · 3_performance L1530 getattr 로 DB 기록
     
 @dataclass
 class TradingSettings:

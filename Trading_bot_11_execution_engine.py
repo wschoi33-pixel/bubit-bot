@@ -1361,7 +1361,8 @@ class SimulationExecutionEngine(ExecutionEngine):
         total_value = self.balance + holdings_value
         returns = ((total_value - self.initial_balance) / self.initial_balance) * PERCENT_CONVERSION
         
-        logger.info("시뮬레이션 종료 - 수익률: %+.2f%%, 최종자산: %s원", returns, f"{total_value:,.0f}")
+        # [SIMEXIT-DISPLAY] 위 값 = 현금만 (보유 평가 안 함) → 보유 중 종료면 큰 음수로 보임 (11-11 -34.57 %) · 참고 평가는 7_bot 최종 성과 줄
+        logger.info("시뮬레이션 종료 (현금 기준 · 보유 %d 종 평가 안 함) - 현금 수익률: %+.2f%%, 현금: %s원", len(self.holdings), returns, f"{total_value:,.0f}")
         
     def reset(self, initial_balance: Optional[float] = None):
         """시뮬레이션 리셋"""

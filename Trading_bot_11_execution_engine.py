@@ -1368,7 +1368,7 @@ class SimulationExecutionEngine(ExecutionEngine):
         """시뮬레이션 리셋"""
         self.balance = initial_balance or self.initial_balance
         self.holdings.clear()
-        self
+        self.order_history.clear()
         logger.info(f"시뮬레이션 리셋 (잔고: {self.balance:,.0f}원)")
 
 class ExecutionEngineFactory:

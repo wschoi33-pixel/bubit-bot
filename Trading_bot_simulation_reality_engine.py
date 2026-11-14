@@ -523,7 +523,7 @@ class SimulationRealityEngine:
         
         # 체결률 계산
         fill_ratio = self._calculate_fill_ratio(volume, volume_rank, market_regime)
-        filled_volume = volume * fill_ratio / PERCENT_CONVERSION
+        filled_volume = volume if fill_ratio == PERCENT_CONVERSION else volume * fill_ratio / PERCENT_CONVERSION  # [SIMDUST] 100% 체결은 원래 수량 유지
         remaining = volume - filled_volume
         
         # 주문 상태 업데이트

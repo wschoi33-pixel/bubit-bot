@@ -561,6 +561,8 @@ class RealExecutionEngine(ExecutionEngine):
                    volume=float(request.volume), uuid="", state="prepared",
                    tp_stage=int(request.metadata.get('tp_stage', 0) or 0), tp_ratio=float(request.metadata.get('tp_ratio', 0) or 0),  # [보완 v3_4 ①]
                    created_at=datetime.now().isoformat(), closed=False, ev=1)  # [보완 v3_8] 사건 식별 (event_id) 이후 예약 = 성과 DB 부족분 자동 기록 자격
+        if 'quote_age_stale_ref_ms' in request.metadata:
+            rec['quote_age_stale_ref_ms'] = request.metadata['quote_age_stale_ref_ms']
         started = time.monotonic()
         reserved = False
         error = ""
@@ -645,9 +647,43 @@ class RealExecutionEngine(ExecutionEngine):
                           terminal=bool(snap.get('terminal')),
                           request_satisfied=bool(snap.get('satisfied')),
                           error=error or rec.get('error', ''),
-                          quote_age_ms=quote_age, slip_limit=slip_limit),
+                          quote_age_ms=quote_age, slip_limit=slip_limit,
+                          **({'quote_age_stale_ref_ms': rec['quote_age_stale_ref_ms']}
+                             if 'quote_age_stale_ref_ms' in rec else {})),
         )
     
+    async def _quote_age_book_price(self, mds, symbol, side, ref_px, quote_age):
+        """[QUOTEAGE-BOOK v1_1 · 11-14] 기준가 = 호가 (매수 BUY = 매도1 · 매도 SELL = 매수1 · 호가 = 늘 지금 값)
+        None = 조회 실패 · 1.0 초 초과 · 종목 불일치 · 1 호가 역전 · 비유한 · (ref_px > 0 일 때만) 중간가 vs ref 괴리 > 1 %
+        호가 timestamp = 마지막 변경 시각 (조회 시각 아님) → 나이 검사 안 함 (OB_TS_PROBE_v1)"""
+        try:
+            if not hasattr(mds, 'get_orderbook'):
+                return None
+            ob = await asyncio.wait_for(mds.get_orderbook([symbol]), timeout=1.0)
+            units = (ob[0].get('orderbook_units')
+                     if isinstance(ob, list) and ob and isinstance(ob[0], dict)
+                     and ob[0].get('market') == symbol else None)
+            if not units:
+                logger.warning(f"⚠️ [QUOTEAGE-BOOK] {symbol} {side} 호가 없음")
+                return None
+            a1, b1 = float(units[0]['ask_price']), float(units[0]['bid_price'])
+            if not (math.isfinite(a1) and math.isfinite(b1) and a1 > b1 > 0):
+                logger.warning(f"⚠️ [QUOTEAGE-BOOK] {symbol} {side} 호가 비정상 (매도1 {a1} · 매수1 {b1})")
+                return None
+            mid = (a1 + b1) / 2.0
+            if ref_px and ref_px > 0 and abs(mid - ref_px) / ref_px > 0.01:
+                logger.warning(f"⚠️ [QUOTEAGE-BOOK] {symbol} {side} 호가 중간가 {mid:,.8g} vs 최근 체결 {ref_px:,.8g} 괴리 > 1%")
+                return None
+            px = a1 if side == "BUY" else b1
+            logger.info(
+                f"[QUOTEAGE-BOOK] {symbol} {side} | 시세 나이 {quote_age}ms → 호가 기준가 {px:,.8g} "
+                f"(매도1 {a1:,.8g} · 매수1 {b1:,.8g} · 스프레드 {(a1 - b1) / mid * 100:.3f}%)"
+            )
+            return float(px)
+        except Exception as e:
+            logger.warning(f"⚠️ [QUOTEAGE-BOOK] {symbol} {side} 호가 조회 오류: {type(e).__name__}: {e}")
+            return None
+
     async def initialize(self) -> bool:
         """실거래 엔진 초기화"""
         try:
@@ -683,6 +719,7 @@ class RealExecutionEngine(ExecutionEngine):
                 'dynamic_sanity': True, 'sanity_base_pct': 0.40,
                 'sanity_min_pct': 0.30, 'sanity_max_pct': 0.80,
                 'sanity_k_vol': 1.50,
+                'quote_age_book_buy': False, 'quote_age_sell_no_block': False,   # [QUOTEAGE-BOOK v1_1] 둘 다 끔 = 지금 그대로
             }
             exconf = None
             try:
@@ -727,6 +764,12 @@ class RealExecutionEngine(ExecutionEngine):
             sanity_min = float(exconf.get('sanity_min_pct', 0.30))
             sanity_max = float(exconf.get('sanity_max_pct', 0.80))
             k_vol = float(exconf.get('sanity_k_vol', 1.50))
+            # [QUOTEAGE-BOOK v1_1 · 11-14] REST 시세 timestamp = 마지막 체결 시각 · 오래된 REST 시세는 호가로 보완
+            #   quote_age_book_buy = 매수 : 오래된 시세 대신 매도1 기준가 · 호가 거부 시 매수 중단
+            #   quote_age_sell_no_block = 매도 : 시세 지연 · 직전 괴리로 막지 않음 (매수1 기준가 · 안 되면 최근 체결가 · 경보만)
+            _qa_on = lambda _k: str(exconf.get(_k, False)).lower() in ('true', '1', 'yes', 'on')
+            qa_buy, qa_sell = _qa_on('quote_age_book_buy'), _qa_on('quote_age_sell_no_block')
+            _qa_used_book = False
             
             attempt = 0
             current_price = 0.0
@@ -762,6 +805,27 @@ class RealExecutionEngine(ExecutionEngine):
                         prev_close = current_price or 1.0
                     break
                 
+                # [QUOTEAGE-BOOK v1_1] 켜진 쪽 : 재조회 (같은 마지막 체결 시각) 대신 호가 1 회
+                if (side == "BUY" and qa_buy) or (side == "SELL" and qa_sell):
+                    _tp = float(tkr.get("trade_price", 0.0) or 0.0)
+                    # 매수 = 최근 체결가와 1 % 넘게 다르면 거부 · 매도 = 검사 없이 지금 매수1 (큰 움직임이면 그게 맞는 값)
+                    _bk = await self._quote_age_book_price(mds, request.symbol, side, _tp if side == "BUY" else 0.0, quote_age)
+                    _from_book = _bk is not None
+                    if _bk is None and side == "SELL" and math.isfinite(_tp) and _tp > 0:
+                        logger.warning(f"⚠️ [QUOTEAGE-BOOK] {request.symbol} SELL 시세 {quote_age}ms 지연 · 호가 실패 → 매도 안 막음 (최근 체결가 {_tp:,.8g} · 경보만 · 슬리피지 기록 = 옛 가격 기준)")
+                        request.metadata['quote_age_stale_ref_ms'] = int(quote_age)
+                        _bk = _tp
+                    if _bk is not None:
+                        current_price = float(_bk)
+                        _qa_used_book = _from_book
+                        prev_close = float(tkr.get("prev_closing_price") or tkr.get("opening_price") or current_price)
+                        if prev_close == 0:
+                            prev_close = current_price or 1.0
+                        break
+                    if side == "BUY":
+                        raise RuntimeError(
+                            f"{request.symbol} 시세 지연: {quote_age}ms > {age_limit_ms}ms · 호가 기준가 거부 (QUOTEAGE-BOOK · 재시도 없음)"
+                        )
                 attempt += 1
                 if attempt >= q_retry:
                     raise RuntimeError(
@@ -784,6 +848,21 @@ class RealExecutionEngine(ExecutionEngine):
             # 🆕 체결 직전 재검증 함수
             async def _precommit_check(ref_px: float) -> float:
                 """주문 직전 최신 시세로 괴리 검증"""
+                if _qa_used_book:
+                    # [QUOTEAGE-BOOK v1_1] 기준가가 호가면 직전 재검증도 호가 · 1 % 검사 없이 (ref 0) 아래 동적 괴리 검사로 (v1 = 큰 변동을 조회 실패로 보고 옛 가격 통과 → 고침)
+                    _bk2 = await self._quote_age_book_price(mds, request.symbol, side, 0.0, -1)
+                    if _bk2 is None:
+                        logger.warning(f"⚠️ [{request.symbol}] pre-commit 호가 조회 실패, 기존 가격 사용")
+                        return ref_px
+                    gap = abs(_bk2 - ref_px) / max(_bk2, 1e-9) * 100.0
+                    if gap > eff_sanity:
+                        if side == "SELL" and qa_sell:
+                            logger.warning(f"⚠️ [QUOTEAGE-BOOK] {request.symbol} SELL 직전 괴리 {gap:.2f}% > {eff_sanity:.2f}% (호가) → 매도 안 막음 (경보만)")
+                            return _bk2
+                        raise RuntimeError(
+                            f"{request.symbol} 가격 괴리 {gap:.2f}% > {eff_sanity:.2f}% (pre-commit check · 호가)"
+                        )
+                    return _bk2
                 tickers_pre = await mds.get_ticker([request.symbol])
                 if not tickers_pre or len(tickers_pre) == 0:
                     logger.warning(f"⚠️ [{request.symbol}] pre-commit 시세 조회 실패, 기존 가격 사용")
@@ -794,6 +873,10 @@ class RealExecutionEngine(ExecutionEngine):
                 gap = abs(px - ref_px) / max(px, 1e-9) * 100.0
                 
                 if gap > eff_sanity:
+                    if side == "SELL" and qa_sell:
+                        # [QUOTEAGE-BOOK v1_1 · Fable] 급락 중 손절 매도가 직전 괴리로 막히지 않게 (경보만)
+                        logger.warning(f"⚠️ [QUOTEAGE-BOOK] {request.symbol} SELL 직전 괴리 {gap:.2f}% > {eff_sanity:.2f}% → 매도 안 막음 (경보만)")
+                        return px
                     raise RuntimeError(
                         f"{request.symbol} 가격 괴리 {gap:.2f}% > {eff_sanity:.2f}% (pre-commit check)"
                     )
@@ -813,7 +896,10 @@ class RealExecutionEngine(ExecutionEngine):
             # ============================================================
             if request.price > 0:  # 지정가 주문인 경우
                 sanity = abs(request.price - current_price) / current_price * 100
-                if sanity > eff_sanity:  # 🆕 동적 임계값 사용
+                if sanity > eff_sanity and side == "SELL" and qa_sell:
+                    # [QUOTEAGE-BOOK v1_1] 요청가 (봇 판단 때 가격) vs 지금 가격 괴리 = 급락 중 손절이면 당연 → 매도 안 막음 (경보만)
+                    logger.warning(f"⚠️ [QUOTEAGE-BOOK] {request.symbol} SELL 요청가 괴리 {sanity:.2f}% > {eff_sanity:.2f}% → 매도 안 막음 (경보만)")
+                elif sanity > eff_sanity:  # 🆕 동적 임계값 사용
                     raise RuntimeError(
                         f"{request.symbol} 가격 괴리 {sanity:.2f}% > {eff_sanity:.2f}% (체결 중단)"
                     )

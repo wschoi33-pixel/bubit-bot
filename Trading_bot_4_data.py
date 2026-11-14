@@ -352,6 +352,12 @@ class MarketDataService:
     async def get_tickers(self, markets: List[str]) -> List[Dict]:
         """티커 데이터 조회 (get_ticker의 별칭)"""
         return await self.get_ticker(markets)    
+
+    async def get_orderbook(self, markets: List[str]) -> List[Dict]:
+        """[ORDERBOOK-REST 11-14] 호가 조회 (REST · 매번 새로) — SPREADGATE · SIMFILL 공용 · 실패 = []"""
+        if not markets or not self.api or not hasattr(self.api, 'fetch_orderbook'):
+            return []
+        return await self.api.fetch_orderbook(markets)  
         
     async def get_current_price(self, market: str) -> float:
         """현재가 조회 - 캐시 비활성화 + WebSocket 우선"""
@@ -901,6 +907,25 @@ class UpbitAPIClient:
             logger.debug(f"✅ REST 마켓 데이터(티커) 조회 성공: {len(all_tickers)}/{len(markets)}개")
         
         return all_tickers
+
+    async def fetch_orderbook(self, markets: List[str], timeout_s: float = 1.0) -> List[Dict]:
+        """[ORDERBOOK-REST 11-14 · v1_1] REST 호가 조회 (공개 · 인증 없음 · 읽기 전용) — SPREADGATE · SIMFILL 공용
+        회로 차단기 안 거침 (실패가 시세 조회를 막지 않게) · 속도 제한 = 같이 · 시간 제한 timeout_s · 실패 = [] (호출자가 지금과 같은 경로로)"""
+        if not markets:
+            return []
+        try:
+            await self._ensure_session()
+            await self.rate_limiter.wait_if_needed()
+            async with self.session.get(f"{self.api_base_url}/v1/orderbook", params={'markets': ','.join(markets[:100])},
+                                        timeout=aiohttp.ClientTimeout(total=float(timeout_s))) as response:
+                if response.status != 200:
+                    logger.warning(f"[ORDERBOOK-REST] 호가 조회 HTTP {response.status}")
+                    return []
+                result = await response.json()
+                return result if isinstance(result, list) else []
+        except Exception as e:
+            logger.warning(f"[ORDERBOOK-REST] REST 호가 조회 오류: {type(e).__name__}: {e}")
+            return []
     
     async def get_balance(self, *, strict: bool = False) -> List[Dict]:
         """strict=True: 조회 실패를 실제 잔고 0으로 바꾸지 않는다."""

@@ -91,6 +91,16 @@ def _vwap_from_book(side, orderbook, levels, qty):
             break
     return v/q if q>0 else None
 
+
+def _sim_book_vwap(levels, qty):
+    """[SIMFILL-BOOK v1_2] 호가 단계 [(가격, 수량)] 을 qty 만큼 쌓은 평균가 · 못 채운 수량 → (평균가 또는 None, 남은 수량)"""
+    v = q = 0.0; remain = float(qty)
+    for px, sz in levels:
+        take = min(remain, float(sz)); v += float(px) * take; q += take; remain -= take
+        if remain <= 1e-12:
+            break
+    return (v / q if q > 0 else None), max(0.0, remain)
+
 @dataclass
 class OrderRequest:
     """주문 요청 통합 데이터"""
@@ -961,15 +971,64 @@ class SimulationExecutionEngine(ExecutionEngine):
             if not math.isfinite(drift) or drift > tol:
                 logger.error(f"❌ [Sim체결거부] {request.symbol} 매수 | 감지가 {ref:,.4f} · 현재가 {now_px:,.4f} · 괴리 {drift*100:.3f}% > {tol*100:.2f}%")
                 return self._sim_reject(request, start_time, f"sim 매수 거부 : 감지가 괴리 {drift*100:.3f}% > {tol*100:.2f}%")
-            required = float(request.volume) * now_px * (1 + self.fee_rate)
+            _book_px = await self._sim_book_price(request, 'buy', now_px)   # [SIMFILL-BOOK] 켜짐 · 정상일 때만 값 · 아니면 None = 기존 최근 체결가
+            _fill_ref = float(_book_px) if _book_px is not None else float(now_px)
+            required = float(request.volume) * _fill_ref * (1 + self.fee_rate)
             if not math.isfinite(required) or self.balance < required:
                 return self._sim_reject(request, start_time, f"잔고 부족 (현재가 재계산) : {self.balance:.0f} < {required:.0f}")
-            return float(now_px)
+            return _fill_ref
         if side == 'sell':
             if ref_ok and abs(ref - now_px) / now_px > tol:
                 logger.warning(f"⚠️ [Sim체결] {request.symbol} 매도 감지가 괴리 → 현재가 {now_px:,.4f} 로 체결")
-            return float(now_px)
+            _book_px = await self._sim_book_price(request, 'sell', now_px)   # [SIMFILL-BOOK]
+            return float(_book_px) if _book_px is not None else float(now_px)
         return self._sim_reject(request, start_time, f"sim 거부 : 알 수 없는 side ({getattr(request, 'side', None)})")
+
+    async def _sim_book_price(self, request, side, now_px):
+        """[SIMFILL-BOOK 11-14 · v1_2] SIM 체결 기준가 = 호가창 VWAP (매수 = 매도 호가 · 매도 = 매수 호가 · 요청 수량만큼 쌓아 평균)
+        켜기 = config.ini [SIMULATION_REALITY] sim_fill_from_orderbook = true (없음 · false = 끔 = 기존 그대로)
+        None (= 최근 체결가로 되돌림) = 끔 · 조회 실패/1.5초 초과 · 종목 불일치 · 1 호가 역전 · 중간가 괴리 1% 초과 · 깊이 부족 · 호가 변경 시각은 관측만
+        켜지면 request.metadata['sim_book_fill'] (px · ref · levels) → 리얼리티 (부분 체결 = 실제 수량으로 VWAP 다시) · 기본 경로 (기록 = 실제 호가 비용) 가 씀"""
+        try:
+            if not self.config.getboolean('SIMULATION_REALITY', 'sim_fill_from_orderbook', fallback=False):
+                return None
+        except Exception:
+            return None
+        try:
+            from Trading_bot_4_data import MarketDataService  # @singleton = 봇과 같은 인스턴스
+            _svc = MarketDataService()
+            if not hasattr(_svc, 'get_orderbook'):
+                return None
+            ob = await asyncio.wait_for(_svc.get_orderbook([request.symbol]), timeout=1.5)
+            units = (ob[0].get('orderbook_units')
+                     if isinstance(ob, list) and ob and isinstance(ob[0], dict)
+                     and ob[0].get('market') == request.symbol else None)
+            if not units:
+                logger.warning(f"⚠️ [SIMFILL-BOOK] {request.symbol} {side} 호가 없음 → 최근 체결가 {now_px:,.8g}")
+                return None
+            a1, b1 = float(units[0]['ask_price']), float(units[0]['bid_price'])
+            mid = (a1 + b1) / 2.0
+            if not (math.isfinite(a1) and math.isfinite(b1) and a1 > b1 > 0) or abs(mid - now_px) / now_px > 0.01:
+                logger.warning(f"⚠️ [SIMFILL-BOOK] {request.symbol} {side} 호가 비정상 (매도1 {a1} · 매수1 {b1} · 최근 체결 {now_px}) → 최근 체결가")
+                return None
+            _ts = float((ob[0] or {}).get('timestamp', 0) or 0)   # [v1_3] 관측용 · 업비트 호가 timestamp = 마지막으로 바뀐 시각 (조회 시각 아님) → 검사 안 함 (OB_TS_PROBE_v1)
+            _age = (time.time() - _ts / 1000.0) if _ts > 0 else -1.0
+            _lv = [(float(u['ask_price']), float(u['ask_size'])) for u in units] if side == 'buy' else [(float(u['bid_price']), float(u['bid_size'])) for u in units]
+            px, _left = _sim_book_vwap(_lv, float(request.volume))   # [v1_2] 못 채운 수량 같이
+            if _left > 1e-12:
+                logger.warning(f"⚠️ [SIMFILL-BOOK] {request.symbol} {side} 호가 깊이 부족 (요청 {float(request.volume):.8g} · 못 채움 {_left:.8g}) → 최근 체결가")
+                return None
+            if px is None or not math.isfinite(px) or px <= 0:
+                return None
+            request.metadata['sim_book_fill'] = {'px': float(px), 'a1': a1, 'b1': b1, 'ref': float(now_px), 'book_age_s': round(_age, 1), 'levels': [list(x) for x in _lv]}
+            logger.info(
+                f"[SIMFILL-BOOK] {request.symbol} {side} | 기준가 {px:,.8g} (매도1 {a1:,.8g} · 매수1 {b1:,.8g} · 최근 체결 {now_px:,.8g} "
+                f"· 스프레드 {(a1 - b1) / mid * 100:.3f}% · 최근 체결 대비 {(px / now_px - 1) * 100:+.3f}% · 호가 나이 {_age:.1f}초)"
+            )
+            return float(px)
+        except Exception as e:
+            logger.warning(f"⚠️ [SIMFILL-BOOK] {request.symbol} {side} 예외 → 최근 체결가: {e}")
+            return None
 
     def _sim_reject(self, request, start_time, msg: str):
         try:
@@ -1124,6 +1183,16 @@ class SimulationExecutionEngine(ExecutionEngine):
                 # ========================================
                 # 🔥 개선: 90% 체결 처리 로직
                 # ========================================
+                # [SIMFILL-BOOK] 호가 VWAP 기준가를 썼으면 모형 미끄러짐을 빼고 그 값으로 체결 (체결률 · 지연은 리얼리티 그대로)
+                _bk = request.metadata.get('sim_book_fill')
+                if _bk and result.get('filled_price'):
+                    _fv = float(result.get('filled_volume') or 0)   # [v1_2] 부분 체결 = 실제 체결 수량만큼 호가 다시 쌓음
+                    _pf = _sim_book_vwap(_bk.get('levels') or [], _fv)[0] if _fv > 0 else None
+                    _pf = float(_pf) if (_pf is not None and math.isfinite(_pf) and _pf > 0) else float(_bk['px'])
+                    result['filled_price'] = _pf
+                    result['slippage'] = (_pf / float(_bk['ref']) - 1) * 100 * (1 if request.side == 'buy' else -1)
+                    # [v1_2] 리얼리티 내부 기록 (order_state · 통계) = 모형 값 그대로 (보고용 · 매매 판단에 안 씀)
+
                 cancel_reason = result.get('cancel_reason', '')
                 
                 # 90% 이상 체결은 성공으로 간주!
@@ -1180,6 +1249,8 @@ class SimulationExecutionEngine(ExecutionEngine):
                 logger.debug(f"[Sim엔진] 기본 시뮬레이션 모드")
                 
                 slippage = BASIC_SLIPPAGE if request.metadata.get('use_slippage', True) else 0
+                if request.metadata.get('sim_book_fill'):   # [SIMFILL-BOOK] 기준가 = 호가 VWAP (스프레드 포함) → 미끄러짐 다시 안 얹음
+                    slippage = 0
                 
                 if request.side == 'buy':
                     executed_price = request.price * (1 + slippage)
@@ -1193,6 +1264,9 @@ class SimulationExecutionEngine(ExecutionEngine):
                 #    (그 집단 손절률 74.4% · 3분내손절 48.8% · 실현 -0.68% = 통계 오염)
                 #  → 실제 호가 단위로 스냅. 실거래 경로에는 영향 없음(sim 전용 분기).
                 executed_price = snap_to_upbit_tick(executed_price, "round")
+                if request.metadata.get('sim_book_fill'):   # [SIMFILL-BOOK] VWAP = 여러 호가 평균 → 반올림으로 유리하게 깎지 않음
+                    executed_price = float(request.metadata['sim_book_fill']['px'])
+                    slippage = (executed_price / float(request.metadata['sim_book_fill']['ref']) - 1) * (1 if request.side == 'buy' else -1)   # [v1_2] 기본 경로 기록 = 실제 호가 비용 (전 = 0)
                 fee = executed_price * request.volume * self.fee_rate
                 
                 latency = random.uniform(50, 200) / 1000

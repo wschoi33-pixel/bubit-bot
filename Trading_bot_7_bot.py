@@ -5308,7 +5308,8 @@ class UnifiedTradingBot:
                 _rec_ok = await self._record_sell_shortfall(
                     _ev_ident, position.symbol, float(_q8(_md_r.get('executed_volume_q') or response.executed_volume, 'even')),
                     float(response.executed_price) * float(_q8(_md_r.get('executed_volume_q') or response.executed_volume, 'even')), float(response.fee),  # [보완 v3_10 K8] 목표 수량과 같은 수량
-                    position, str(getattr(signal, 'reason', '') or ''), md=metadata_for_record, sig=signal)
+                    position, str(getattr(signal, 'reason', '') or ''), md=metadata_for_record, sig=signal,
+                    slip_pct=getattr(response, "slippage_pct", None))   # [SELLREC-1114] 정상 매도 = 엔진 응답 미끄러짐
             else:
                 _rec_ok = await self.performance.record_trade_complete(
                     position, result, signal, metadata_for_record
@@ -6490,7 +6491,7 @@ class UnifiedTradingBot:
             except Exception as e:
                 logger.critical(f"[LATE-FILL-HOLD] {sym} id={ident} {type(e).__name__}: {e}")
 
-    async def _record_sell_shortfall(self, ident, sym, target_v, target_f, target_c, src, reason, md=None, sig=None):
+     async def _record_sell_shortfall(self, ident, sym, target_v, target_f, target_c, src, reason, md=None, sig=None, slip_pct=None):   # [SELLREC-1114] slip_pct = 정상 매도만 (복구 · 재기록 = 기준가 모름 → 0)
         """[보완 v3_7 · v3_8] 회계 진실 = 성과 DB : 이 주문으로 이미 기록된 (수량 · 금액 · 수수료) 를 빼고 모자란 만큼만 기록 · 사건 id = ord:{ident}:{target_v}
         [v3_8] 정상 · 복구 · 재기록이 모두 이 함수 · 조회 → 계산 → INSERT 를 한 잠금 안에서 (같은 프로세스 안 경쟁 제거)
         반환 True = 기록했거나 기록할 것 없음 · False = 미기록 (부채) · 초과 기록 (기록 > 확인 체결) = False + critical (자동 해소 없음)"""
@@ -6525,7 +6526,13 @@ class UnifiedTradingBot:
                 logger.critical(f"[EVENT-CONTENT-DIFF] {sym} id={ident} 증분 비정상 (금액 {sf} · 수수료 {sc}) → HOLD")
                 return "diff"
             sc = max(0.0, sc)
-            _r = ExecutionResult(success=True, symbol=sym, side="sell", executed_volume=sv, avg_price=sf / sv, total_fee=sc)
+            _sp = float(slip_pct) if slip_pct is not None else 0.0
+            _sp_ok = slip_pct is not None and _sp == _sp and abs(_sp) != float('inf')
+            if _sp_ok and rv > 0:
+                # [SELLREC-v1_1] 누적 응답의 기준가로 부족분 체결가의 미끄러짐을 계산
+                _sp += (1.0 - (sf / sv) / (float(target_f) / float(target_v))) * (100.0 - _sp)
+            _sp = _sp if (_sp_ok and _sp == _sp and abs(_sp) != float('inf')) else 0.0
+            _r = ExecutionResult(success=True, symbol=sym, side="sell", executed_volume=sv, avg_price=sf / sv, total_fee=sc, slippage_pct=_sp)   # [SELLREC-1114] REAL 매도 미끄러짐 DB 전달 (전엔 빠져 0 · SIM = SELLSLIP 이 고침)
             _sig = sig if sig is not None else type("ShortfallSignal", (), {"reason": reason, "confidence": 0.0, "market_regime": None, "sell_ratio": 1.0, "metadata": {}})()
             _md = dict(md or {}); _md["event_id"] = f"ord:{ident}:{float(_q8(target_v, 'even')):.8f}"
             _ok = await self.performance.record_trade_complete(src, _r, _sig, _md)

@@ -1724,6 +1724,18 @@ class UnifiedTradingBot:
                     self.performance,
                     risk_metrics
                 )
+                # [REALRESTORE-1111] REAL : 보유 중 최고 수익률 (6_strategy 가 갱신 · TU-Giveback · BE 기준) 오르면 영속 (재기동 복원용 · 실패 = 경보만 · 거래 계속)
+                if self.mode == 'real':
+                    try:
+                        _rr_k = tuple((lambda _v: _v if _v == _v and abs(_v) != float('inf') else 0.0)(float(getattr(position, _a, 0.0) or 0.0)) for _a in ('max_profit_pct', 'max_profit_closed'))   # [v1_4] NaN 캐시가 저장 막지 않게
+                        _rr_d = self.__dict__.setdefault('_rr_saved_maxp', {})
+                        _rr_key = (symbol, str(getattr(position, 'entry_time', '')))   # [v1_3] 종목 + 진입 시각 (같은 종목 재매수 때 옛 기록이 저장 막지 않게)
+                        _rr_p = _rr_d.get(_rr_key)   # (값, 저장 시각) · 오르면 5 초 간격 저장 (본전 보호 경계 넘을 때 늦지 않게 · 쓰기 = 종목당 5 초에 1 번 이하)
+                        if self.positions.get(symbol) is position and (_rr_p is None or (max(_rr_k[0] - _rr_p[0][0], _rr_k[1] - _rr_p[0][1]) > 0 and time.time() - _rr_p[1] >= 5)):
+                            self._persist_position(symbol)
+                            _rr_d[_rr_key] = (_rr_k, time.time())
+                    except Exception as _rr_pe:
+                        logger.critical(f"[REALRESTORE] {symbol} 최고 수익률 영속 실패 (거래 계속): {_rr_pe}")
                 
                 # 15 캔들 MA 이탈 체크
                 if not signal and ma_data:
@@ -4633,7 +4645,7 @@ class UnifiedTradingBot:
                             pass
                 else:
                     # 신규 포지션 생성
-                    await self._create_position(signal, response)
+                    await self._create_position(signal, response, entry_balance=balance)
                     # 📒 [DECISION-LEDGER] 관측 전용 — 신규 포지션이 실제로 만들어졌는지 읽는다.
                     #  (_create_position 은 실패해도 예외 없이 return 한다: 체결 0 · 비정상 체결액 롤백 · 손익비 검증 실패)
                     if self._decision_ledger is not None:
@@ -4775,7 +4787,7 @@ class UnifiedTradingBot:
                     f"(허용: {min_take_pct*100:.1f}% ~ {max_take_pct*100:.1f}%)"
                 )
     
-    async def _create_position(self, signal, response):
+    async def _create_position(self, signal, response, entry_balance=None):
         """
         포지션 생성 - 안전장치 3중 검증
         Args:
@@ -4796,49 +4808,17 @@ class UnifiedTradingBot:
             self._dl_note(signal, "POS_FILL_ZERO")  # 📒 [DECISION-LEDGER] 관측 전용
             return
         
-        # 금액 역산 검증 (슬리피지 + 수수료 여유 반영)
+        # [POSTFILL-MANAGED] 금액 점검은 주문 전 잔고 기준 · 체결 수량은 반드시 관리
         total_cost = response.executed_volume * response.executed_price
-        balance = await self.engine.get_balance()
+        balance = float(entry_balance) if entry_balance is not None else await self.engine.get_balance()
         max_pos_ratio = float(self.config.get_cached('max_position_size') or 0.20)
-        # 1.2 → 1.35로 증가 (슬리피지 3% + 수수료 0.05% + 여유 10%)
         expected_max_cost = balance * max_pos_ratio * 1.35
-        
         if total_cost > expected_max_cost:
-            logger.error(
-                f"❌ [포지션생성] {signal.symbol} 비정상 체결액! "
-                f"{total_cost:,.0f}원 > 예상최대 {expected_max_cost:,.0f}원"
+            logger.critical(
+                f"🚨 [POSITION-COST-ALERT] {signal.symbol} 체결액 {total_cost:,.0f}원 > "
+                f"점검 기준 {expected_max_cost:,.0f}원 → 확인 체결량을 포지션에 반영하여 관리"
             )
-            # 롤백 시도
-            rollback_success = False
-            try:
-                rollback_request = OrderRequest(
-                    symbol=signal.symbol,
-                    side='sell',
-                    volume=response.executed_volume,
-                    price=response.executed_price,
-                    metadata={
-                        'rollback': True,
-                        'regime': signal.market_regime.value if signal.market_regime else 'ROLLBACK'
-                    }
-                )
-                rollback_response = await self.engine.execute_order(rollback_request)
-                rollback_success = bool(getattr(rollback_response, 'success', False))
-
-                if rollback_success:
-                    logger.warning(f"⚠️ [포지션생성] {signal.symbol} 롤백 완료")
-                else:
-                    logger.critical(
-                        f"🚨 [롤백실패] {signal.symbol} 롤백 응답 success=False "
-                        f"→ 거래소 잔존 의심. 잔고 동기화 필요."
-                    )
-
-            except Exception as e:
-                logger.critical(
-                    f"🚨 [롤백실패] {signal.symbol} 롤백 예외: {e} "
-                    f"→ 거래소 잔존 의심. 잔고 동기화 필요."
-                )
-            self._dl_note(signal, "POS_ABNORMAL_COST_ROLLBACK")  # 📒 [DECISION-LEDGER] 관측 전용
-            return
+            self._dl_note(signal, "POS_ABNORMAL_COST_MANAGED")
         
         # ========================================
         # 2. ATR 안전하게 추출
@@ -6494,7 +6474,7 @@ class UnifiedTradingBot:
     async def _record_sell_shortfall(self, ident, sym, target_v, target_f, target_c, src, reason, md=None, sig=None, slip_pct=None):   # [SELLREC-1114] slip_pct = 정상 매도만 (복구 · 재기록 = 기준가 모름 → 0)
         """[보완 v3_7 · v3_8] 회계 진실 = 성과 DB : 이 주문으로 이미 기록된 (수량 · 금액 · 수수료) 를 빼고 모자란 만큼만 기록 · 사건 id = ord:{ident}:{target_v}
         [v3_8] 정상 · 복구 · 재기록이 모두 이 함수 · 조회 → 계산 → INSERT 를 한 잠금 안에서 (같은 프로세스 안 경쟁 제거)
-        반환 True = 기록했거나 기록할 것 없음 · False = 미기록 (부채) · 초과 기록 (기록 > 확인 체결) = False + critical (자동 해소 없음)"""
+        반환 True = 기록했거나 기록할 것 없음 · False = 미기록 ㅁ(부채) · 초과 기록 (기록 > 확인 체결) = False + critical (자동 해소 없음)"""
         _own = globals().setdefault("_REAL_ACCT_OWNER", {})  # [보완 v3_12 M2] 프로세스 안 회계 쓰기 소유 루프 = 하나 (v3_11 = 루프마다 잠금)
         _cur = asyncio.get_running_loop()
         with globals().setdefault("_REAL_ACCT_OWNER_GUARD", __import__("threading").Lock()):
@@ -6624,7 +6604,15 @@ class UnifiedTradingBot:
                 volume=float(p.volume), avg_price=float(p.avg_price), original_volume=float(getattr(p, 'original_volume', 0.0) or 0.0),
                 entry_fee_paid=float(getattr(p, 'entry_fee_paid', 0.0) or 0.0),  # [보완 v3_10 K3]
                 partial_sell_count=int(getattr(p, 'partial_sell_count', 0) or 0), tp_stage_filled=md.get('tp_stage_filled', {}),
-                late_fill_markers=list(md.get('late_fill_markers', [])), order_applied=md.get('order_applied', {}), saved_at=datetime.now().isoformat()))
+                late_fill_markers=list(md.get('late_fill_markers', [])), order_applied=md.get('order_applied', {}), saved_at=datetime.now().isoformat(),
+                # [REALRESTORE-1111] 재기동 때 원래 손절 · 보유시간 · 트레일링 기준 복원용 (없으면 복구 = config 고정 % · 재기동 시각 · ATR 0 · 최고 수익률 0)
+                stop_loss=(lambda _v: _v if _v == _v and abs(_v) != float('inf') else 0.0)(float(getattr(p, 'stop_loss', 0.0) or 0.0)), take_profit=(lambda _v: _v if _v == _v and abs(_v) != float('inf') else 0.0)(float(getattr(p, 'take_profit', 0.0) or 0.0)),   # [v1_4] 숫자 칸 전부 유한 아니면 0 (allow_nan=False 저장 예외 방지 · 0 = 복원 때 건너뜀)
+                entry_time=(p.entry_time.isoformat() if getattr(p, 'entry_time', None) is not None else None), entry_atr=(lambda _v: _v if _v == _v and abs(_v) != float('inf') else 0.0)(float(getattr(p, 'entry_atr', 0.0) or 0.0)),
+                entry_regime=str(getattr(getattr(p, 'entry_regime', None), 'value', getattr(p, 'entry_regime', None)) or ''), peak_price=(lambda _v: _v if _v == _v and abs(_v) != float('inf') else 0.0)(float(getattr(p, 'peak_price', 0.0) or 0.0)),
+                trailing_stop_distance=(lambda _v: _v if _v == _v and abs(_v) != float('inf') else 0.0)(float(getattr(p, 'trailing_stop_distance', 0.0) or 0.0)),
+                # [v1_3] 원 저장 = json allow_nan=False → 유한 아닌 값은 None (저장 실패로 반영 확인 멈춤 방지)
+                max_profit_pct=(float(p.max_profit_pct) if hasattr(p, 'max_profit_pct') and float(p.max_profit_pct) == float(p.max_profit_pct) and abs(float(p.max_profit_pct)) != float('inf') else None),
+                max_profit_closed=(float(p.max_profit_closed) if hasattr(p, 'max_profit_closed') and float(p.max_profit_closed) == float(p.max_profit_closed) and abs(float(p.max_profit_closed)) != float('inf') else None)))
         except Exception as e:
             logger.critical(f"[POSITION-STATE-HOLD] {symbol} 영속 저장 실패: {e}")
             raise
@@ -6654,6 +6642,29 @@ class UnifiedTradingBot:
         else:
             md['efp_unknown'] = True  # 옛 상태 = 매수 수수료 근거 없음 → 자동 성과 기록 거부
         pos.metadata = md
+        # [REALRESTORE-1111] 원래 손절 · 익절 · 진입 시각 · ATR · 체제 · 최고가 · 트레일링 폭 · 최고 수익률 복원 · 먼저 전부 검증 → 한꺼번에 반영 (하나라도 실패 = 아무것도 안 바꿈 · config 값 유지) · 옛 상태 = 키 없음 → 지금과 같음
+        try:
+            _u = {}
+            if float(s.get('stop_loss') or 0) > 0: _u['stop_loss'] = float(s['stop_loss'])
+            if float(s.get('take_profit') or 0) > 0: _u['take_profit'] = float(s['take_profit'])
+            if s.get('entry_time'): _u['entry_time'] = datetime.fromisoformat(s['entry_time'])
+            if float(s.get('entry_atr') or 0) > 0: _u['entry_atr'] = float(s['entry_atr'])
+            if float(s.get('peak_price') or 0) > 0: _u['peak_price'] = max(float(pos.peak_price or 0), float(s['peak_price']))
+            if float(s.get('trailing_stop_distance') or 0) > 0: _u['trailing_stop_distance'] = float(s['trailing_stop_distance'])
+            if s.get('entry_regime'): _u['entry_regime'] = MarketRegime(s['entry_regime'])
+            if s.get('max_profit_pct') is not None: _u['max_profit_pct'] = float(s['max_profit_pct'])
+            if s.get('max_profit_closed') is not None: _u['max_profit_closed'] = float(s['max_profit_closed'])
+            for _k, _v in _u.items():   # [v1_2] 숫자 유한성 (inf · nan 거부)
+                if isinstance(_v, float) and (_v != _v or _v in (float('inf'), float('-inf'))): raise ValueError(f'{_k}={_v} 유한 아님')
+            if 'stop_loss' in _u and 'take_profit' in _u and not (_u['stop_loss'] < float(pos.avg_price) < _u['take_profit']):
+                raise ValueError(f"손절 {_u['stop_loss']} · 평균가 {pos.avg_price} · 익절 {_u['take_profit']} 순서 아님")
+        except Exception as _rr_e:
+            logger.critical(f"[REALRESTORE] {pos.symbol} 복원 값 검증 실패 → 아무것도 안 바꿈 (config 값 유지): {_rr_e}")
+            _u = {}
+        for _k, _v in _u.items():
+            setattr(pos, _k, _v)
+        if _u:
+            logger.warning(f"🔁 [REALRESTORE] {pos.symbol} 복원 {sorted(_u)} · 손절 {pos.stop_loss:,.4f} · 진입 {pos.entry_time}")
         if abs(exch_v - pos.volume) > 1e-8:
             logger.critical(f"[POSITION-STATE-DIFF] {pos.symbol} 거래소 {exch_v:.8f} ≠ 영속 {pos.volume:.8f} → 늦은 체결 복구 · 대조가 판정 (자동 편입 없음)")
 

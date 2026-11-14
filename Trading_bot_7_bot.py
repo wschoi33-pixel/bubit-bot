@@ -4751,6 +4751,12 @@ class UnifiedTradingBot:
         Raises:
             ValueError: 비율이 허용 범위를 벗어날 때
         """
+        # [SLTPFIX-v1_1] NaN·무한대와 손절 -100% 이하·익절 0 이하 차단
+        from math import isfinite
+        if (not isfinite(stop_loss_pct) or not -1.0 < stop_loss_pct < 0.0
+                or (take_profit_pct is not None
+                    and (not isfinite(take_profit_pct) or take_profit_pct <= 0.0))):
+            raise ValueError(f"[SLTP_INVALID] {symbol} 손절 {stop_loss_pct} · 익절 {take_profit_pct}")
         # 손절 검증 (경계값 포함)
         min_stop_pct = -abs(float(self.settings.stop_loss_pct)) if min_stop_pct is None else min_stop_pct
         if stop_loss_pct > (min_stop_pct + eps) or stop_loss_pct < max_stop_pct:
@@ -4910,10 +4916,42 @@ class UnifiedTradingBot:
                 max_stop_pct=-0.10 - _tick_frac,
             )
         except ValueError as e:
-            # 검증 실패 시 포지션 생성 중단
             logger.error(f"❌ [포지션생성] {e}")
             self._dl_note(signal, "POS_SLTP_INVALID")  # 📒 [DECISION-LEDGER] 관측 전용
-            return None
+            # [SLTPFIX-v1_1] 체결 수량을 관리 포지션으로 반영한 뒤 기존 기록·원장 확인 절차로 진행
+            from math import isfinite
+
+            def _finite_pct(value, fallback):
+                try:
+                    value = float(value)
+                    return value if isfinite(value) else fallback
+                except (TypeError, ValueError, OverflowError):
+                    return fallback
+
+            _cfg_sl = abs(_finite_pct(self.settings.stop_loss_pct, 0.010))
+            if not 0.001 <= _cfg_sl <= 0.10:
+                _cfg_sl = 0.010
+            _cfg_tp = abs(_finite_pct(self.settings.take_profit_pct, 0.015))
+            if not 0.001 <= _cfg_tp <= 0.20:
+                _cfg_tp = 0.015
+            _sl_min = -_cfg_sl
+            _sl_max = -0.10 - _tick_frac
+            _slp = min(max(_finite_pct(stop_loss_pct, _sl_min), _sl_max), _sl_min)
+            if not -1.0 < _slp < 0.0:
+                _slp = _sl_min
+            _tpp = min(max(_finite_pct(take_profit_pct, _cfg_tp), 0.005), 0.50)
+            self._validate_stop_take_pct(
+                symbol=signal.symbol, stop_loss_pct=_slp, take_profit_pct=_tpp,
+                min_stop_pct=_sl_min, max_stop_pct=_sl_max,
+            )
+            stop_loss = response.executed_price * (1.0 + _slp)
+            take_profit = response.executed_price * (1.0 + _tpp)
+            stop_loss_pct, take_profit_pct = _slp, _tpp
+            logger.critical(
+                f"🛟 [SLTP-CLAMP] {signal.symbol} 체결 후 손절·익절 보정 → 포지션 관리 유지 | "
+                f"손절 {stop_loss_pct * 100:.3f}% · 익절 {take_profit_pct * 100:.3f}%"
+            )
+            self._dl_note(signal, "POS_SLTP_CLAMPED")  # 📒 [DECISION-LEDGER] 관측 전용
         
         # ========================================
         # 7. 최종 로그 (손익 확정값)

@@ -4073,6 +4073,59 @@ class UnifiedTradingBot:
                 
                 logger.debug(f"[매수실행] {signal.symbol} 주문 수량: {volume:.8f}개 (검증 통과)")
                 
+                # 🔒 [SPREADGATE-1114 · v1_2] 신규 매수 직전 호가 스프레드 관문 (기본 꺼짐 = config.ini [EXECUTION] spread_gate_enabled · 켜기 조건 = 새 전향 통과)
+                #   스프레드 = (매도1 − 매수1) ÷ 중간가 × 100 · 문턱 초과 = 매수 안 함 + 그 종목 60 초 재조회 없이 막음 · 호가 없음 · 이상 · 시간 초과 = 통과 (지금과 같게) + 경고 · 조회가 신호 나이 허용을 넘기면 STALE
+                if position is None and self.config.getboolean("EXECUTION", "spread_gate_enabled", fallback=False):
+                    from math import isfinite as _sg_isf
+                    from datetime import datetime as _sg_dt  # execute_trade 의 datetime = 3714 행 지역 import · 경로에 안 기대게 별칭
+                    try:
+                        _sg_max = float(self.config.getfloat("EXECUTION", "spread_gate_max_pct", fallback=0.16))
+                    except Exception:
+                        _sg_max = float('nan')
+                    if not (_sg_isf(_sg_max) and 0.0 < _sg_max <= 5.0):
+                        logger.warning(f"⚠️ [SPREAD-GATE] 문턱 설정 이상 ({_sg_max}) → 기본 0.16 %")
+                        _sg_max = 0.16
+                    _sg_blk = getattr(self, "_spread_gate_block", None)
+                    if _sg_blk is None:
+                        _sg_blk = self._spread_gate_block = {}
+                    if time.time() - float(_sg_blk.get(signal.symbol, 0.0)) < 60.0:
+                        logger.info(f"🚫 [SPREAD-GATE] {signal.symbol} 60 초 안 넓은 스프레드로 막힘 → 매수 안 함 (재조회 없음)")
+                        self._dl_note(signal, "SPREAD_GATE_HOLD")  # 📒 [DECISION-LEDGER] 관측 전용
+                        return False
+                    _sg_pct = None
+                    _sg_bage = None
+                    _sg_t0 = time.time()
+                    try:
+                        _sg_ob = await asyncio.wait_for(self.data_service.get_orderbook([signal.symbol]), timeout=1.5) if hasattr(self.data_service, "get_orderbook") else []
+                        _sg_r = _sg_ob[0] if (isinstance(_sg_ob, list) and _sg_ob and isinstance(_sg_ob[0], dict)) else None
+                        _sg_u = ((_sg_r or {}).get("orderbook_units") or [None])[0]
+                        _sg_ts = float((_sg_r or {}).get("timestamp") or 0)
+                        _sg_bage = (time.time() - _sg_ts / 1000.0) if _sg_ts > 0 else None  # 관측용 · 업비트 timestamp = 호가가 마지막으로 바뀐 시각 (조회 시각 아님) → 검사에 안 씀
+                        if _sg_r and _sg_r.get("market") == signal.symbol and _sg_u:
+                            _sg_a, _sg_b = float(_sg_u["ask_price"]), float(_sg_u["bid_price"])
+                            if _sg_isf(_sg_a) and _sg_isf(_sg_b) and _sg_a > _sg_b > 0:
+                                _sg_pct = (_sg_a - _sg_b) / ((_sg_a + _sg_b) / 2.0) * 100.0
+                    except Exception as _sg_e:
+                        logger.warning(f"⚠️ [SPREAD-GATE] {signal.symbol} 호가 조회 예외 · 시간 초과 → 통과 (지금과 같게): {type(_sg_e).__name__}")
+                    _sg_fetch = time.time() - _sg_t0
+                    if getattr(signal, "timestamp", None):
+                        _sg_sa = (_sg_dt.now() - signal.timestamp).total_seconds()
+                        _sg_lim = {'1m': 2.0, '3m': 3.0, '5m': 5.0, '10m': 8.0, '15m': 10.0, '30m': 15.0, '1h': 20.0, '4h': 30.0, '1d': 60.0}.get(self.timeframe.value, 5.0)
+                        if _sg_sa > _sg_lim and _sg_sa - _sg_fetch <= _sg_lim:  # 조회 때문에 넘긴 경우만 (조회 전 이미 넘은 것 = 지금과 같게)
+                            logger.warning(f"⏰ [신호폐기] {signal.symbol} | 호가 조회 {_sg_fetch:.2f}초 뒤 신호 경과 {_sg_sa:.1f}초 > 허용 {_sg_lim:.1f}초 | STALE 신호 - 주문 취소")
+                            self._dl_note(signal, "STALE_SIGNAL")  # 📒 [DECISION-LEDGER] 관측 전용
+                            return False
+                    _sg_bs = ("%.1f" % _sg_bage) if _sg_bage is not None else "?"
+                    if _sg_pct is None:
+                        logger.warning(f"⚠️ [SPREAD-GATE] {signal.symbol} 호가 없음 · 이상 · 시간 초과 → 통과 (지금과 같게)")
+                    elif _sg_pct > _sg_max:
+                        _sg_blk[signal.symbol] = time.time()
+                        logger.info(f"🚫 [SPREAD-GATE] {signal.symbol} 스프레드 {_sg_pct:.3f}% > {_sg_max:.2f}% → 매수 안 함 (60 초 재조회 없음) · 조회 {_sg_fetch * 1000:.0f}ms · 호가 변경 {_sg_bs}초 전")
+                        self._dl_note(signal, "SPREAD_GATE")  # 📒 [DECISION-LEDGER] 관측 전용
+                        return False
+                    else:
+                        logger.info(f"✅ [SPREAD-GATE] {signal.symbol} 스프레드 {_sg_pct:.3f}% ≤ {_sg_max:.2f}% → 통과 · 조회 {_sg_fetch * 1000:.0f}ms · 호가 변경 {_sg_bs}초 전")
+
                 # 주문 요청 생성
                 request = OrderRequest(
                     symbol=signal.symbol,

@@ -6491,7 +6491,7 @@ class UnifiedTradingBot:
             except Exception as e:
                 logger.critical(f"[LATE-FILL-HOLD] {sym} id={ident} {type(e).__name__}: {e}")
 
-     async def _record_sell_shortfall(self, ident, sym, target_v, target_f, target_c, src, reason, md=None, sig=None, slip_pct=None):   # [SELLREC-1114] slip_pct = 정상 매도만 (복구 · 재기록 = 기준가 모름 → 0)
+    async def _record_sell_shortfall(self, ident, sym, target_v, target_f, target_c, src, reason, md=None, sig=None, slip_pct=None):   # [SELLREC-1114] slip_pct = 정상 매도만 (복구 · 재기록 = 기준가 모름 → 0)
         """[보완 v3_7 · v3_8] 회계 진실 = 성과 DB : 이 주문으로 이미 기록된 (수량 · 금액 · 수수료) 를 빼고 모자란 만큼만 기록 · 사건 id = ord:{ident}:{target_v}
         [v3_8] 정상 · 복구 · 재기록이 모두 이 함수 · 조회 → 계산 → INSERT 를 한 잠금 안에서 (같은 프로세스 안 경쟁 제거)
         반환 True = 기록했거나 기록할 것 없음 · False = 미기록 (부채) · 초과 기록 (기록 > 확인 체결) = False + critical (자동 해소 없음)"""

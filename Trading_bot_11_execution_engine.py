@@ -619,6 +619,7 @@ class RealExecutionEngine(ExecutionEngine):
                         await asyncio.sleep(0.25)
         except asyncio.CancelledError:
             # prepared/조회 결과는 이미 영속화되어 있다. 취소는 호출자에게 전달.
+            self.release_inflight(ident, "주문 응답 전 취소")
             raise
         except Exception as e:
             error = f"{type(e).__name__}: {e}"

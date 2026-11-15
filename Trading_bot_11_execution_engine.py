@@ -268,13 +268,19 @@ class RealExecutionEngine(ExecutionEngine):
     def order_block_reason(self, symbol: str, side: str) -> str:
         try:
             pending = self.pending_orders()
-            if any(r['symbol'] == symbol for r in pending):
+            _same = [r for r in pending if r['symbol'] == symbol]
+            if _same and not (side.lower() == 'sell' and self._sell_allowed_over(_same)):  # [JOURNALFIX-1115 F3] 열린 행 = 전부 거래소 종결 매수 → 매도 (손절 · 청산) 허용
                 return "해당 종목의 주문 미종결/포지션 반영 미확정 (조회: real_journal_resolve.py list · 강제 종결 금지)"
             if side.lower() == 'buy' and len(pending) >= self.GLOBAL_BUY_HALT_PENDING:
                 return f"미확정 주문 {len(pending)} 건: 신규 매수 전체 차단 (조회: real_journal_resolve.py list · 강제 종결 금지)"
             return ""
         except Exception as e:
             return f"주문 원장 확인 실패: {e}"
+
+    @staticmethod
+    def _sell_allowed_over(rows: List[Dict]) -> bool:
+        """[JOURNALFIX-1115 F3] 같은 종목 열린 행이 **전부 매수** 이고 **전부 거래소 종결 (done · cancel) 확인** 일 때만 그 위 매도 허용 · 열린 매도 · 미종결 매수 (wait · watch · unknown · 404) = 거부 (중복 청산 · 회계 꼬임 방지)"""
+        return bool(rows) and all(r.get('side') == 'buy' and bool((r.get('snapshot') or {}).get('terminal')) for r in rows)
 
     def _write_order(self, rec: Dict, *, reserve: bool = False) -> None:
         if self._journal_fault or self._journal is None:
@@ -286,10 +292,13 @@ class RealExecutionEngine(ExecutionEngine):
                 duplicate = db.execute(
                     "SELECT 1 FROM orders WHERE id=?", (rec['identifier'],)
                 ).fetchone()
-                pending_markets = [m for (m,) in db.execute(
-                    "SELECT market FROM orders WHERE closed=0"
+                _open_rows = [json.loads(p) for (p,) in db.execute(
+                    "SELECT payload FROM orders WHERE closed=0"
                 ).fetchall()]
-                blocked = (rec['symbol'] in pending_markets
+                pending_markets = [r.get('symbol') for r in _open_rows]
+                _same_open = [r for r in _open_rows if r.get('symbol') == rec['symbol']]
+                # [JOURNALFIX-1115 F3] 예약 트랜잭션 (BEGIN IMMEDIATE) 안에서 payload 방향 · 종결 재검사 → 동시 두 매도 = 하나만 예약
+                blocked = ((bool(_same_open) and not (rec['side'] == 'sell' and self._sell_allowed_over(_same_open)))
                            or (rec['side'] == 'buy'
                                and len(pending_markets) >= self.GLOBAL_BUY_HALT_PENDING))
                 if duplicate or blocked:
@@ -406,6 +415,7 @@ class RealExecutionEngine(ExecutionEngine):
         # [보완 v3_4 G3] 봇이 반영한 수량·수수료 = 거래소 확인 체결 (acknowledge 는 기대수량 == 반영수량 확인 뒤에만 호출) 이면 요청량 미충족 (부분 체결 뒤 취소) 이어도 종결 · 남은 단계 목표는 7_bot tp_stage_filled 가 관리
         rec['closed'] = bool(snap['terminal'] and rec['accounting_ok'])  # [보완 v3_5] 부채 · 과거 실패 포함
         self._write_order(rec)
+        self.__dict__.setdefault('_jf_inflight', {}).pop(ident, None)   # [v1_2] 반영 끝 → 진행 중 해제
 
     # ---------- [보완 v3_4 ①] 늦은 체결 복구 (REAL_LATE_FILL_RECOVERY_DESIGN_v2) ----------
     def _pending_rec(self, ident: str) -> Dict:
@@ -466,12 +476,33 @@ class RealExecutionEngine(ExecutionEngine):
             rec['apply_hold'] = str(reason)
             self._write_order(rec)
 
+    def _jf_inflight_live(self, ident: str) -> bool:
+        """[JOURNALFIX-1115 v1_3 · TF 9 차] 주문 경로 (소유자) 가 끝내기 전 주문 = 대조 · 복구가 건드리지 않음 · 시간으로 안 풀림
+        해제 = 소유자만 : acknowledge_order 끝 · 체결 0 종료 · 7_bot 주문 반영 길 finally (성공 · 실패 · 취소 모두 = 복구로 인계)
+        120 초 = 경보만 (주문 경로가 돌아온 시각부터 · CRITICAL 1 회 · 계속 건너뜀)"""
+        _fl = self.__dict__.setdefault('_jf_inflight', {})
+        ent = _fl.get(ident)
+        if ent is None:
+            return False
+        t_ret = ent.get('returned')
+        if t_ret is not None and time.monotonic() - t_ret > 120.0 and not ent.get('alerted'):
+            ent['alerted'] = True
+            logger.critical(f"[ORDER-INFLIGHT-SLOW] id={ident} 주문 응답 뒤 120 초 · 반영 길이 아직 안 끝남 (소유자 살아 있음) · 복구 안 함 · 확인 필요")
+        return True
+
+    def release_inflight(self, ident: str, why: str = "") -> None:
+        """[v1_3] 소유자 (주문 반영 길) 가 끝날 때 부름 · 그 뒤 = 대조 · 늦은 체결 복구가 맡음"""
+        if ident and self.__dict__.setdefault('_jf_inflight', {}).pop(ident, None) is not None and why:
+            logger.info(f"[ORDER-INFLIGHT-RELEASE] id={ident} {why}")
+
     def late_fills(self) -> List[Dict]:
-        """자동 복구 대상 = 확인 체결 (snapshot) > 반영 (applied) 또는 수수료 증가 또는 진행 중 intent · apply_hold 제외"""
+        """자동 복구 대상 = 확인 체결 (snapshot) > 반영 (applied) 또는 수수료 증가 또는 진행 중 intent · apply_hold 제외 · [v1_2] 진행 중 주문 제외"""
         out = []
         for rec in self.pending_orders():
             snap = rec.get('snapshot') or {}
             if not snap or rec.get('apply_hold'):
+                continue
+            if self._jf_inflight_live(rec['identifier']):
                 continue
             dv = float(snap.get('volume', 0.0)) - float(rec.get('applied_volume', 0.0) or 0.0)
             dc = float(snap.get('fee', 0.0)) - float(rec.get('applied_fee', 0.0) or 0.0)
@@ -540,9 +571,27 @@ class RealExecutionEngine(ExecutionEngine):
         """조회만 수행. 오래된 조회가 체결 반영·종결 기록을 덮어쓰지 못한다."""
         for rec in self.pending_orders():
             try:
+                try:   # [JOURNALFIX-1115 v1_1 · Fable 1] 만든 지 15 초 안 행 = 주문 경로가 아직 조회 · 쓰는 중 (판 번호 충돌 → 정상 주문 「불명」) → 대조 안 함
+                    _jf_age = (datetime.now() - datetime.fromisoformat(str(rec.get('created_at')))).total_seconds()
+                except Exception:
+                    _jf_age = 10 ** 9
+                if _jf_age < 15.0 or self._jf_inflight_live(rec['identifier']):   # [v1_2] 진행 중 주문 = 시간 어림 대신 목록으로
+                    continue
                 order = await self.api.get_order(
-                    rec.get('uuid'), identifier=rec['identifier']
+                    rec.get('uuid'), identifier=rec['identifier'], not_found_marker=True
                 )
+                if isinstance(order, dict) and order.get('_not_found') or not order:
+                    # [JOURNALFIX-1115 F1 · v1_1] 「주문 없음」 / 조회 실패 = 메모리에서만 셈 (원장 판 번호 안 올림) · 60 초 지난 행 · 3 · 30 · 300 회째만 원장 기록 + 경보 · 자동 종결 아님
+                    _jf_k = 'not_found_count' if order else 'lookup_fail_count'
+                    _jf_m = self.__dict__.setdefault('_jf_counts', {}).setdefault(rec['identifier'], {})
+                    _jf_m[_jf_k] = _jf_m.get(_jf_k, 0) + 1
+                    _jf_lv = [x for x in (3, 30, 300) if _jf_m[_jf_k] >= x]   # [v1_2 · Fable] 60 초 전 3 회 넘어도 60 초 뒤 첫 기회에 경보 (v1_1 = 다음 경보 30 회 = 약 5 분 뒤)
+                    if _jf_age >= 60.0 and _jf_lv and _jf_m.get(_jf_k + '_alerted', 0) < _jf_lv[-1]:
+                        _jf_m[_jf_k + '_alerted'] = _jf_lv[-1]
+                        rec[_jf_k] = _jf_m[_jf_k]; rec[_jf_k.replace('_count', '_last')] = datetime.now().isoformat()
+                        self._write_order(rec)
+                        logger.critical(f"[ORDER-NOT-FOUND] {rec['symbol']} id={rec['identifier']} {'거래소 「주문 없음」' if order else '조회 실패'} {_jf_m[_jf_k]} 회 · 자동 종결 안 함 (증거 대조 뒤 수동 해소)")
+                    continue
                 if order:
                     snap = self._fill_snapshot(order, rec)
                     rec['uuid'], rec['snapshot'] = snap['uuid'], snap
@@ -586,9 +635,22 @@ class RealExecutionEngine(ExecutionEngine):
                     raise ValueError("매도 수량 8 자리 내림 후 0")
                 if rec['volume'] >= 8.0e6:
                     logger.warning(f"[PRECISION-WARN] {request.symbol} 매도 수량 {rec['volume']} ≥ 8.0e6 : 1e-8 정확 보존 근거 밖 · 매도는 진행 (자산 보존)")  # [보완 v3_5]
+                _jf_open = [r for r in self.pending_orders() if r['symbol'] == request.symbol]
+                if _jf_open:   # [JOURNALFIX-1115 F3] 종결 매수 행 위 매도 = 거래소 가용 잔고 (locked 빼고) 로 줄임 · 조회 실패 = 전송 안 함
+                    _jf_acc = await self.api.get_balance(strict=True)
+                    _jf_cur = request.symbol.replace('KRW-', '')
+                    _jf_free = sum(float(a.get('balance', 0) or 0) for a in _jf_acc if a.get('currency') == _jf_cur)
+                    _jf_fq = float(Decimal(str(_jf_free)).quantize(Decimal('1e-8'), rounding=ROUND_DOWN))
+                    if not _jf_fq > 0:
+                        raise ValueError("열린 매수 행 위 매도 : 거래소 가용 잔고 0 → 전송 안 함")
+                    if _jf_fq < rec['volume']:
+                        logger.critical(f"[SELL-OVER-OPEN] {request.symbol} 매도 {rec['volume']:.8f} → 가용 잔고 {_jf_fq:.8f} 로 줄임 (열린 매수 행 {len(_jf_open)})")
+                        rec['volume'] = _jf_fq
+                    rec['sell_over_open'] = [r['identifier'] for r in _jf_open]
             rec['amount'] = amount if rec['side'] == 'buy' else 0.0
             self._write_order(rec, reserve=True)  # POST 이전에 영속 기록
             reserved = True
+            self.__dict__.setdefault('_jf_inflight', {})[ident] = dict(reserved=time.monotonic(), returned=None)   # [v1_3] 진행 중 주문 등록 (소유자 해제 전까지)
             if rec['side'] == 'buy':
                 submitted = await self.api.buy_market_order(
                     request.symbol, amount, identifier=ident
@@ -604,7 +666,9 @@ class RealExecutionEngine(ExecutionEngine):
                 rec.update(uuid=submitted.get('uuid', ''), state='unknown')
                 self._write_order(rec)
                 for attempt in range(6):
-                    order = await self.api.get_order(rec.get('uuid'), identifier=ident)
+                    order = await self.api.get_order(rec.get('uuid'), identifier=ident, not_found_marker=True)
+                    if isinstance(order, dict) and order.get('_not_found'):
+                        order = None  # [JOURNALFIX-1115 F1] 접수 직후 404 = 아직 안 보임 · 대조가 이어서 셈 (차단기 실패 아님)
                     if order:
                         # 이상 응답도 식별자를 잃지 않은 상태로 원장에 남긴다.
                         rec['last_response'] = repr(order)[:8000]
@@ -632,6 +696,10 @@ class RealExecutionEngine(ExecutionEngine):
 
         snap = rec.get('snapshot', {})
         volume, funds = snap.get('volume', 0.0), snap.get('funds', 0.0)
+        if not volume > 0:
+            self.__dict__.setdefault('_jf_inflight', {}).pop(ident, None)   # [v1_2] 체결 0 = 봇이 반영할 것 없음 → 해제 (대조가 이어 받음)
+        elif ident in self.__dict__.setdefault('_jf_inflight', {}):
+            self._jf_inflight[ident]['returned'] = time.monotonic()   # [v1_3 · Fable] 경보 시계 = 주문 경로가 돌아온 시각부터
         price = funds / volume if volume > 0 else 0.0
         unknown = bool(reserved and not rec.get('closed') and (
             error or not snap.get('terminal') or not snap.get('satisfied')))

@@ -4712,6 +4712,12 @@ class UnifiedTradingBot:
                                  reason=str(getattr(signal, 'reason', '') or ''),  # [보완 v3_7] 원 신호 사유 (리포트 분류 유지) · 사건 식별 = event_id
                                  efp=self._entry_fee_share(position, response.executed_volume),
                                  efp_total=float(getattr(position, 'entry_fee_paid', 0.0) or 0.0), ov=float(getattr(position, 'original_volume', 0.0) or 0.0))  # [보완 v3_10 K3]
+                elif _rf and signal.action == "BUY":
+                    _jf_bp = self.positions.get(signal.symbol)   # [JOURNALFIX-1115 F6] 매수 기록 실패 = 부채 (재기록 근거 = 포지션 값 · 성과 DB 같은 시각 BUY 행 있으면 해소)
+                    if _jf_bp is not None:
+                        _debt = dict(kind="buy_record", symbol=signal.symbol, ident=_ident, entry_time=_jf_bp.entry_time.isoformat(),
+                                     avg_price=float(_jf_bp.avg_price), volume=float(response.executed_volume), fee=float(response.fee),
+                                     reason=str((_jf_bp.metadata or {}).get('entry_type') or _jf_bp.entry_reason or "ENTRY"))
                 self.engine.acknowledge_order(response, accounting_ok=not _rf, debt=_debt)
             logger.info(f"✅ 거래 성공: {signal.action} {signal.symbol}")
             return True
@@ -4721,6 +4727,13 @@ class UnifiedTradingBot:
             self._dl_note(signal, "EXECUTE_EXCEPTION")  # 📒 [DECISION-LEDGER] 관측 전용
             return False
         finally:
+            try:   # [JOURNALFIX-1115 v1_3 · TF 9 차] 주문 반영 길 (소유자) 끝 = 성공 · 실패 · 취소 모두 진행 중 해제 → 그 뒤 대조 · 늦은 체결 복구가 맡음 (반영 주체 하나)
+                _jf_resp = locals().get('response')
+                _jf_rid = ((getattr(_jf_resp, 'metadata', None) or {}).get('identifier')) if _jf_resp is not None else None
+                if _jf_rid and hasattr(self.engine, 'release_inflight'):
+                    self.engine.release_inflight(_jf_rid, "반영 길 끝")
+            except Exception as _jf_re:
+                logger.critical(f"[ORDER-INFLIGHT-RELEASE] 해제 실패 {_jf_re}")
             if (
                 sell_claimed
                 and position is not None
@@ -5066,12 +5079,15 @@ class UnifiedTradingBot:
         )
 
         try:
-            await self.performance.record_buy_open(
+            _jf_bo = await self.performance.record_buy_open(
                 new_position,
                 response,
                 signal,
                 timeframe=self.timeframe.value,
             )
+            if self.mode == 'real' and _jf_bo is not True:   # [JOURNALFIX-1115 F6] 3p 가 실패를 삼키던 길 → 부채 (acknowledge 에서 buy_record)
+                response.metadata['_record_failed'] = True
+                logger.critical(f"[B2-BUY-RECORD-FAIL] {signal.symbol} BUY 성과 기록 실패 → 부채 buy_record · 자동 재기록")
         except Exception as e:
             if self.mode == 'real':
                 response.metadata['_record_failed'] = True
@@ -6354,9 +6370,13 @@ class UnifiedTradingBot:
                         held = float(pos.volume) if pos is not None else 0.0
                         if side == 'buy' and held + dv > exch + 1e-8:
                             logger.critical(f"[LATE-FILL-HOLD] {sym} id={ident} 복구 뒤 봇 {held + dv:.8f} > 거래소 {exch:.8f} (balance + locked) → 중단")
+                            if self._jf_persist_mismatch(ident, "F7"):   # [JOURNALFIX-1115 F7 · v1_1 · Fable 2] 같은 불일치 300 초 ∧ 3 회 이상일 때만 보류 (잔고 조회가 잠깐 늦은 일시 불일치 = 다음 주기 재시도 · 그대로)
+                                self.engine.mark_apply_hold(ident, f"복구 뒤 봇 {held + dv:.8f} > 거래소 {exch:.8f}")
                             continue
                         if side == 'sell' and (pos is None or held + 1e-8 < dv):
                             logger.critical(f"[LATE-FILL-HOLD] {sym} id={ident} 매도 증분 {dv:.8f} > 봇 보유 {held:.8f} → 중단")
+                            if self._jf_persist_mismatch(ident, "F2"):   # [JOURNALFIX-1115 F2 · v1_1 · Fable 2] 같은 불일치 300 초 ∧ 3 회 이상일 때만 보류 (잔고 조회가 잠깐 늦은 일시 불일치 = 다음 주기 재시도 · 그대로)
+                                self.engine.mark_apply_hold(ident, f"매도 증분 {dv:.8f} > 봇 보유 {held:.8f} (포지션 {'없음' if pos is None else '있음'} · 저장 상태 {'있음' if _ts else '없음'})")
                             continue
                         px = df / dv  # 추가분 가격 = ΔF / ΔV (누적 평균 아님)
                         async with self._positions_lock:
@@ -6529,6 +6549,38 @@ class UnifiedTradingBot:
         except Exception:
             return 0.0
 
+    def _jf_persist_mismatch(self, ident, kind):
+        """[JOURNALFIX-1115 v1_1] 같은 주문 · 같은 종류 불일치가 처음 본 뒤 300 초 ∧ 3 회 이상이면 True (보류 표시 자격) · 메모리만"""
+        _m = self.__dict__.setdefault('_jf_mm', {}); _k = (ident, kind); _t = time.time()
+        _f, _n = _m.get(_k, (_t, 0)); _m[_k] = (_f, _n + 1)
+        return (_n + 1) >= 3 and (_t - _f) >= 300.0
+
+    def _perf_has_buy(self, symbol, entry_time_iso):
+        """[JOURNALFIX-1115 F6] 성과 DB 에 그 종목 · 그 진입 시각 BUY 행이 있는가 (읽기 전용 · record_buy_open 이 timestamp = position.entry_time.isoformat())"""
+        import sqlite3
+        from pathlib import Path
+        p = getattr(self.performance, 'db_path', None)
+        if not p:
+            raise RuntimeError("성과 DB 경로 없음")
+        con = sqlite3.connect(Path(p).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        try:
+            return con.execute("SELECT 1 FROM trade_details WHERE side='BUY' AND symbol=? AND timestamp=? LIMIT 1", (symbol, entry_time_iso)).fetchone() is not None
+        finally:
+            con.close()
+
+    def _perf_buy_rows(self, symbol, entry_time_iso):
+        """[JOURNALFIX-1115 v1_4 · ChatGPT 9 차] 그 종목 · 그 진입 시각 BUY 행들 (수량 · 가격) · 읽기 전용 · 주문별 수량 대조 근거"""
+        import sqlite3
+        from pathlib import Path
+        p = getattr(self.performance, 'db_path', None)
+        if not p:
+            raise RuntimeError("성과 DB 경로 없음")
+        con = sqlite3.connect(Path(p).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+        try:
+            return [(float(v or 0.0), float(px or 0.0)) for v, px in con.execute("SELECT volume, price FROM trade_details WHERE side='BUY' AND symbol=? AND timestamp=?", (symbol, entry_time_iso)).fetchall()]
+        finally:
+            con.close()
+
     def _perf_has_reason(self, reason):
         """[보완 v3_5] 성과 DB trade_details 에 같은 reason (주문 표식) 행이 이미 있는가 · 읽기 전용 · 정확히 1 회 기록 근거"""
         import sqlite3
@@ -6550,11 +6602,37 @@ class UnifiedTradingBot:
         for ident, idx, d in self.engine.pending_debts():
             if ident in done:
                 continue
-            done.add(ident)
             try:
+                if d.get('kind') == 'buy_record':   # [JOURNALFIX-1115 F6] 매수 기록 재시도 · 같은 시각 BUY 행 = 1 회만
+                    done.add(ident)
+                    # [v1_4 · ChatGPT 9 차] 해소 = 같은 시각 BUY 행의 수량 · 가격이 이 주문 체결 (부채 기록값) 과 맞을 때만 · 다른 수량 행만 있으면 = 부분 체결 증분 불일치 → 새로 쓰지 않음 · 해소 안 함 · 경보 1 회
+                    _jb_rows = self._perf_buy_rows(d['symbol'], d['entry_time'])
+                    _jb_v, _jb_p = float(d['volume']), float(d['avg_price'])
+                    _jb_match = [r for r in _jb_rows if abs(r[0] - _jb_v) <= max(1e-8, 1e-6 * _jb_v) and abs(r[1] - _jb_p) <= max(1e-12, 1e-6 * _jb_p)]
+                    if _jb_rows and not _jb_match:
+                        _jb_seen = self.__dict__.setdefault('_jf_buy_mismatch', set())
+                        if ident not in _jb_seen:
+                            _jb_seen.add(ident)
+                            logger.critical(f"[ACCOUNTING-DEBT] {d['symbol']} id={ident} buy_record 수량 불일치 · 성과 DB 같은 시각 BUY {_jb_rows} vs 주문 체결 {_jb_v:.8f} @ {_jb_p} · 자동 재기록 · 해소 안 함 (수동 대조)")
+                        continue
+                    if _jb_match:
+                        self.engine.resolve_debt(ident, idx, "BUY 행 확인 (성과 DB · 수량 · 가격 일치)")
+                        continue
+                    if not self._perf_has_buy(d['symbol'], d['entry_time']):
+                        _jbp = Position(symbol=d['symbol'], volume=float(d['volume']), avg_price=float(d['avg_price']), entry_time=datetime.fromisoformat(d['entry_time']),
+                                        entry_reason="RECORD_RETRY:" + str(d.get('reason') or 'ENTRY'), stop_loss=0.0, take_profit=0.0, peak_price=float(d['avg_price']), trailing_stop_distance=0.0,
+                                        entry_atr=0.0, entry_regime=None, original_volume=float(d['volume']), metadata={'entry_type': "RECORD_RETRY:" + str(d.get('reason') or ''), 'record_retry': True})   # [v1_1 · Fable 4] 재기록 행 = 판사 · 체제 정보 없음 → 리포트에서 구분
+                        _jbr = ExecutionResult(success=True, symbol=d['symbol'], side="buy", executed_volume=float(d['volume']), avg_price=float(d['avg_price']), total_fee=float(d.get('fee', 0.0) or 0.0))
+                        await self.performance.record_buy_open(_jbp, _jbr, None, timeframe=self.timeframe.value)
+                    if any(abs(r[0] - _jb_v) <= max(1e-8, 1e-6 * _jb_v) for r in self._perf_buy_rows(d['symbol'], d['entry_time'])):   # [v1_4] 재기록 뒤에도 수량 대조
+                        self.engine.resolve_debt(ident, idx, "BUY 행 확인 (성과 DB · 재기록)")
+                    else:
+                        logger.critical(f"[ACCOUNTING-DEBT] {d.get('symbol')} id={ident} buy_record 재기록 실패 · 다음 주기")
+                    continue
                 if d.get('kind') != 'sell_record':
                     logger.critical(f"[ACCOUNTING-DEBT] {d.get('symbol')} id={ident} {d.get('kind')} = 자동 해소 불가 · 미종결 유지")
-                    continue
+                    continue   # [JOURNALFIX-1115 F5] done 표시 안 함 → 같은 주문 뒤 sell_record 부채도 이번 주기 재시도
+                done.add(ident)
                 if 'target_v' not in d:  # [보완 v3_7] v3_5 / v3_6 형식 (단일 체결 · reason 표식) = 사건 대조 근거 없음 → 자동 해소 안 함
                     logger.critical(f"[ACCOUNTING-DEBT] {d.get('symbol')} id={ident} 옛 형식 매도 부채 = 자동 해소 불가 · 미종결 유지")
                     continue
@@ -6726,6 +6804,16 @@ class UnifiedTradingBot:
         if self.timers.check_and_reset('websocket_check'):
             await self._check_websocket_health()
         
+        # [JOURNALFIX-1115 F4] REAL · 미종결 있으면 10 초 간격 대조 (300 초 타이머와 별개 · 미종결 0 이면 안 탐)
+        if self.mode == 'real':
+            try:
+                if self.engine.pending_orders() and time.time() - float(getattr(self, '_jf_fast_rc', 0.0) or 0.0) >= 10.0:
+                    self._jf_fast_rc = time.time()
+                    await self.engine.refresh_pending_orders()   # [v1_1 · Fable 3] 빠른 길 = 조회 · 늦은 체결 복구만 (경보 · 부채 재시도 · 잔고 대조 = 300 초 주기 그대로 · CRITICAL 30 배 방지)
+                    await self._recover_late_fills()
+            except Exception as _jf_fe:
+                logger.critical(f"[ORDER-RECONCILE-FAST] {_jf_fe}")
+
         # 성과 로그
         if self.timers.check_and_reset('performance'):
             if self.mode == 'real':

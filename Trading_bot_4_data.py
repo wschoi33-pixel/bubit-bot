@@ -707,6 +707,7 @@ class UpbitAPIClient:
     
     async def _request(self, method: str, url: str, **kwargs) -> Optional[Dict]:
         """HTTP 요청 (429 자동 재시도 + 지수 백오프)"""
+        _order_nf = bool(kwargs.pop('_order_nf', False))  # [JOURNALFIX-1115 F1] 주문 조회 404 → 「주문 없음」 표시 (get_order 만)
         await self._ensure_session()
         await self.rate_limiter.wait_if_needed()
         
@@ -776,6 +777,9 @@ class UpbitAPIClient:
                                 f"[404오류] {method} {url} | 종목: {market} | "
                                 f"응답: {error_text[:100]}"
                             )
+                        if _order_nf:
+                            # [JOURNALFIX-1115 F1] 주문 조회 404 = 「주문 없음」 응답 (통신 실패 아님) · 회로 차단기 실패로 안 셈 (손절 포함 전 주문 30 초 거부 방지) · 종결 근거 아님 (호출자가 기록만)
+                            return {'_not_found': True, 'error': error_text[:200]}
                         await self.circuit_breaker.record_failure()
                         return None
                     
@@ -1027,14 +1031,14 @@ class UpbitAPIClient:
         })
 
     async def get_order(
-        self, order_id: str = None, *, identifier: str = None
+        self, order_id: str = None, *, identifier: str = None, not_found_marker: bool = False   # [JOURNALFIX-1115 F1] True = 404 를 {'_not_found': True} 로
     ) -> Optional[Dict]:
         params = {'uuid': order_id} if order_id else {'identifier': identifier}
         if not next(iter(params.values())):
             raise ValueError("uuid 또는 identifier 필수")
         headers = {'Authorization': f'Bearer {self._create_jwt_token(params)}'}
         return await self._request(
-            'GET', f"{self.api_base_url}/v1/order", params=params, headers=headers
+            'GET', f"{self.api_base_url}/v1/order", params=params, headers=headers, _order_nf=not_found_marker
         )
 
     async def cancel_order(self, order_id: str) -> Optional[Dict]:

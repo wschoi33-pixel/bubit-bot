@@ -1103,8 +1103,8 @@ class PerformanceManager:
         result: ExecutionResult,
         signal,
         timeframe: str = "",
-    ) -> None:
-        """BUY 체결을 trade_details에 기록한다."""
+    ) -> bool:
+        """BUY 체결을 trade_details에 기록한다. [JOURNALFIX-1115 F6] True = 기록 commit · False = 스킵 · 실패 (예전 None = 실패를 성공처럼 보임)"""
         try:
             _px = float(
                 getattr(result, "executed_price", 0.0)
@@ -1128,7 +1128,7 @@ class PerformanceManager:
                     f"[B2] {position.symbol} BUY leg 기록 스킵 | "
                     f"price={_px} volume={_vol}"
                 )
-                return
+                return False
 
             _meta = position.metadata or {}
             _signals = dict(position.entry_signals or {})
@@ -1278,6 +1278,7 @@ class PerformanceManager:
                 f"price={_px} volume={_vol} "
                 f"dur={_signals.get('dur_5x10_bars')}"
             )
+            return True   # [JOURNALFIX-1115 F6]
 
         except sqlite3.Error as e:
             if self._conn:
@@ -1289,11 +1290,13 @@ class PerformanceManager:
                 f"[B2] {getattr(position, 'symbol', '?')} "
                 f"BUY leg DB 기록 실패: {e}"
             )
+            return False   # [JOURNALFIX-1115 F6]
         except Exception as e:
             logger.warning(
                 f"[B2] {getattr(position, 'symbol', '?')} "
                 f"BUY leg 기록 실패: {e}"
             )
+            return False   # [JOURNALFIX-1115 F6]
 
     async def record_trade_complete(self, position: Position, result: ExecutionResult,
                        signal, market_data: Dict) -> None:

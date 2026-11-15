@@ -4707,6 +4707,7 @@ class UnifiedTradingBot:
                         ap=float(position.avg_price) if position is not None else 0.0,
                         efp=self._entry_fee_share(position, response.executed_volume))
                 self._persist_position(signal.symbol, fallback=_holder)  # 반영 기록 · 포지션 · TP 진행 영속 → 그 뒤 반영 확인
+                _jf_acked = (_holder is not None and bool(_ident) and not _rf)  # [APPLYHOLD] 성과 기록·영속 저장 완료 시에만 복구 인계
                 _debt = None
                 if _rf and signal.action == "SELL" and position is not None:
                     _debt = dict(kind="sell_record", symbol=signal.symbol, ident=_ident, avg_price=float(position.avg_price),

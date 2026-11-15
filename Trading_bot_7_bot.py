@@ -3703,6 +3703,8 @@ class UnifiedTradingBot:
         sell_claimed = False
         sell_order_succeeded = False
         sell_state_synced = False
+        _jf_apply_started = False   # [APPLYHOLD v1 · D13] REAL 포지션 반영 길 들어감 (포지션 바뀔 수 있음)
+        _jf_acked = False           # [APPLYHOLD v1 · D13] 반영 확인 (acknowledge_order) 끝
 
         try:
             if signal.action == "SELL":
@@ -4624,6 +4626,7 @@ class UnifiedTradingBot:
                 f"{_og3_tag}"
             )
         
+            _jf_apply_started = (self.mode == 'real')   # [APPLYHOLD v1 · D13] 여기부터 포지션 바뀜 · 반영 확인 전 이탈 = 보류 표시 (finally)
             # ========================================
             # 4. 포지션 관리
             # ========================================
@@ -4719,6 +4722,7 @@ class UnifiedTradingBot:
                                      avg_price=float(_jf_bp.avg_price), volume=float(response.executed_volume), fee=float(response.fee),
                                      reason=str((_jf_bp.metadata or {}).get('entry_type') or _jf_bp.entry_reason or "ENTRY"))
                 self.engine.acknowledge_order(response, accounting_ok=not _rf, debt=_debt)
+                _jf_acked = True   # [APPLYHOLD v1 · D13]
             logger.info(f"✅ 거래 성공: {signal.action} {signal.symbol}")
             return True
             
@@ -4727,10 +4731,17 @@ class UnifiedTradingBot:
             self._dl_note(signal, "EXECUTE_EXCEPTION")  # 📒 [DECISION-LEDGER] 관측 전용
             return False
         finally:
-            try:   # [JOURNALFIX-1115 v1_3 · TF 9 차] 주문 반영 길 (소유자) 끝 = 성공 · 실패 · 취소 모두 진행 중 해제 → 그 뒤 대조 · 늦은 체결 복구가 맡음 (반영 주체 하나)
+            _jf_release_ok = False
+            try:
+                _jf_release_ok = self._jf_apply_guard(
+                    locals().get('response'), _jf_apply_started, _jf_acked
+                )
+            except Exception as _jf_ge:
+                logger.critical(f"[ORDER-APPLY-HOLD] 보류 판단 실패 {_jf_ge} · 진행 중 표시 유지")
+            try:
                 _jf_resp = locals().get('response')
                 _jf_rid = ((getattr(_jf_resp, 'metadata', None) or {}).get('identifier')) if _jf_resp is not None else None
-                if _jf_rid and hasattr(self.engine, 'release_inflight'):
+                if _jf_release_ok is True and _jf_rid and hasattr(self.engine, 'release_inflight'):
                     self.engine.release_inflight(_jf_rid, "반영 길 끝")
             except Exception as _jf_re:
                 logger.critical(f"[ORDER-INFLIGHT-RELEASE] 해제 실패 {_jf_re}")
@@ -4742,6 +4753,18 @@ class UnifiedTradingBot:
             ):
                 position._closing = False
     
+    def _jf_apply_guard(self, response, started: bool, acked: bool) -> bool:
+        """REAL 반영 중 이탈을 보류하고, 진행 중 표시를 해제해도 되는지 반환."""
+        if self.mode != 'real' or not started or acked:
+            return True
+        ident = (getattr(response, 'metadata', None) or {}).get('identifier') if response is not None else None
+        if not ident or not hasattr(self.engine, 'mark_apply_hold'):
+            logger.critical("[ORDER-APPLY-HOLD] 주문 식별자 또는 보류 기능 없음 · 진행 중 표시 유지 · 수동 대조 필요")
+            return False
+        self.engine.mark_apply_hold(ident, "반영 길 중간 이탈 (예외 · 취소) · 포지션 반영 여부 수동 대조")
+        logger.critical(f"[ORDER-APPLY-HOLD] id={ident} 반영 길 중간 이탈 · 자동 복구 금지 · 원장 수동 대조 필요")
+        return True
+
     # ========================================
     # 🔒 SSoT-META: 손절/익절 비율 최종 검증
     # 책임: Bot (최종 의사결정자)

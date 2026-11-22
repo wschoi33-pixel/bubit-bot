@@ -92,6 +92,12 @@ class PortfolioRiskManager:
         self.high_correlation_threshold = config.getfloat('PORTFOLIO_RISK', 'correlation_threshold', fallback=CORRELATION_HIGH_THRESHOLD)
         self.correlation_threshold = self.high_correlation_threshold  # 호환성
         self.correlation_window = config.getint('PORTFOLIO_RISK', 'correlation_window', fallback=CORRELATION_WINDOW)
+        # 🔒 [PREWORK-1122 B] 매수 직전 상관 · VaR (3 · 4 단계) 켬 / 끔 · 없음 = 켬 (지금과 같음) · 끄기 = config.ini [PORTFOLIO_RISK] var_corr_enabled = false
+        #   끄면 = 난수 기반 상관 거부 · VaR 축소 · 거부를 하지 않음 (제외 종목 · 노출도 · 섹터 그대로) · 까닭 : 수익률 = 난수 가짜 (_get_historical_returns) · 11 월 로그 「포트폴리오 제한」 0
+        try:
+            self.var_corr_enabled = config.getboolean('PORTFOLIO_RISK', 'var_corr_enabled', fallback=True)
+        except Exception:
+            self.var_corr_enabled = True
         
         # 데이터 저장 - sector_mapping 추가
         self.correlation_matrix = {}
@@ -244,6 +250,13 @@ class PortfolioRiskManager:
                 }
             
             new_position_size = min(new_position_size, max_sector_allowed * VAR_CONFIDENCE_LEVEL)
+        
+        if not getattr(self, 'var_corr_enabled', True):   # 🔒 [PREWORK-1122 B] 상관 · VaR 끔 → 1 · 2 단계 (제외 종목 · 노출도 · 섹터) 결과 크기 그대로
+            return {
+                'can_trade': True,
+                'adjusted_size': new_position_size,
+                'reason': "포트폴리오 리스크 체크 통과 (상관 · VaR 끔)"
+            }
         
         # 3. 상관관계 체크
         correlation_risk = await self.check_correlation_risk(

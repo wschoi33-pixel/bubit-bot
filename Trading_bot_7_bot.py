@@ -1005,6 +1005,8 @@ class UnifiedTradingBot:
                                 f"positions={_position_count_for_entry}/{self.settings.max_positions} "
                                 f"→ _check_entries 호출 전 차단"
                             )
+                        elif await self._prework_balance_below_min(risk_metrics):   # 🔒 [PREWORK-1122 A] 주기 시작 잔고 1 번 · 최소 주문 미만 = 35 종목 진입 검사 전 차단 (기본 꺼짐)
+                            pass
                         else:
                             preserve_cash = self._should_preserve_cash(risk_metrics)
                             
@@ -3892,7 +3894,9 @@ class UnifiedTradingBot:
                         logger.info(f"✅ [재매수허용] {signal.symbol} 쿨다운 해제")
                 
                 # 잔고 조회
-                balance = await self.engine.get_balance()
+                balance = self._pw_take_cycle_balance()   # 🔒 [PREWORK-1122 A] 이번 주기 시작 때 API 로 받은 잔고 (꺼짐 · 다른 주기 · 체결 시도 뒤 = None)
+                if balance is None:
+                    balance = await self.engine.get_balance()
                 
                 # 포지션 크기 계산 (ATR 반영)
                 position_size = self.signal_analyzer.risk_calculator.calculate_position_size(
@@ -4478,7 +4482,10 @@ class UnifiedTradingBot:
                     _sm = signal.metadata if isinstance(getattr(signal, 'metadata', None), dict) else {}
                     request.metadata['tp_stage'] = int(_sm.get('partial_sell_stage', 0) or 0)  # [보완 v3_4 ①] 늦은 매도 체결의 단계 가산
                     request.metadata['tp_ratio'] = float(getattr(signal, 'sell_ratio', 0) or 0)
-            response = await self.engine.execute_order(request)
+            try:
+                response = await self.engine.execute_order(request)
+            finally:
+                self._pw_cycle_bal = None   # 🔒 [PREWORK-1122 A] 정상 · 예외 · 취소 모두 저장 잔고 버림 (같은 주기 다음 매수 = 새로 조회)
             if _dl_on:
                 try:
                     self._decision_ledger.capture_order(
@@ -6034,6 +6041,48 @@ class UnifiedTradingBot:
         
         return is_warning
     
+    async def _prework_balance_below_min(self, risk_metrics) -> bool:
+        """🔒 [PREWORK-1122 A · v1_1] 진입 검사 주기 시작 때 잔고 1 번 (사장님 11-22 · 불타기 없음)
+        ① 잔고 < MIN_ORDER_AMOUNT = execute_trade 의 BALANCE_BELOW_MIN 과 같은 줄 → 35 종목 분석을 미리 건너뜀
+        ② 저장 = API 조회 성공이 확인된 현금만 : REAL = 주기 위험 지표의 current_balance_api_ok 표시가 있을 때 그 값 · 없으면 engine.get_balance() 직접 · SIM = 엔진 잔고
+           조회 예외 · NaN · 음수 = 저장 안 함 · 차단 안 함 (지금과 같게) · 저장 = (값 · 주기 번호 · 받은 시각)
+        꺼짐 = configs/config_3m.ini [POSITION_MANAGEMENT] prework_cycle_balance 없음 · false"""
+        self._pw_cycle_bal = None
+        try:
+            if not self.config.getboolean("POSITION_MANAGEMENT", "prework_cycle_balance", fallback=False):
+                return False
+            _pw_b = None
+            if self.mode == "real" and (risk_metrics or {}).get("current_balance_api_ok"):
+                _pw_b = (risk_metrics or {}).get("current_balance")
+            if _pw_b is None:
+                _pw_b = await self.engine.get_balance()
+            _pw_b = float(_pw_b)
+            if not (0.0 <= _pw_b < float("inf")):
+                return False
+            self._pw_cycle_bal = (_pw_b, int(getattr(self, "_cycle_count", 0)), time.time())
+            if _pw_b < MIN_ORDER_AMOUNT:
+                logger.info(
+                    f"🚫 [BOT-ENTRY-BLOCK] phase=BALANCE_BELOW_MIN_RUN | "
+                    f"잔고={_pw_b:,.0f}원 < 최소={MIN_ORDER_AMOUNT:,}원 → _check_entries 호출 전 차단"
+                )
+                return True
+        except Exception as _pw_e:
+            self._pw_cycle_bal = None
+            logger.warning(f"⚠️ [PREWORK-BAL] 잔고 사전 확인 실패 → 지금과 같게 진행: {type(_pw_e).__name__}")
+        return False
+
+    def _pw_take_cycle_balance(self):
+        """🔒 [PREWORK-1122 A · v1_1] 이번 주기 (주기 번호 같음 · 받은 지 60 초 안) 에 API 로 받은 잔고 · 아니면 None = 지금처럼 새로 조회"""
+        try:
+            if not self.config.getboolean("POSITION_MANAGEMENT", "prework_cycle_balance", fallback=False):
+                return None
+            _c = getattr(self, "_pw_cycle_bal", None)
+            if not _c or int(_c[1]) != int(getattr(self, "_cycle_count", 0)) or not (0.0 <= time.time() - float(_c[2]) <= 60.0):
+                return None
+            return float(_c[0])
+        except Exception:
+            return None
+
     # async def _get_risk_metrics(self):
     async def _get_risk_metrics(self, balance=None):
         """리스크 메트릭"""
@@ -6079,6 +6128,8 @@ class UnifiedTradingBot:
             try:
                 real_balance = balance if balance is not None else await self.engine.get_balance()
                 metrics['current_balance'] = real_balance
+                if balance is None:
+                    metrics['current_balance_api_ok'] = True   # 🔒 [PREWORK-1122 A] 이번에 API 로 받은 값 (실패 = 이 표시 없음 → 사전 확인이 직접 조회)
                 logger.debug(f"[실거래잔고] {'캐시' if balance is not None else 'API조회'}: {real_balance:,.0f}원")        
             except Exception as e:
                 logger.warning(f"실거래 잔고 조회 실패, 계산값 사용: {e}")

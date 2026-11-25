@@ -5361,6 +5361,55 @@ class TechnicalIndicators:
         elif _entry_clean and _entry_ma5 > _entry_ma10 > 0.0:
             entry_type = "TREND"
         indicators['entry_type'] = entry_type
+        try:
+            from Trading_bot_4_data import OnsetFlowBook
+            _on_tf = (
+                timeframe.value
+                if hasattr(timeframe, 'value')
+                else str(timeframe)
+            )
+            if (
+                OnsetFlowBook.enabled
+                and symbol in OnsetFlowBook.symbols
+                and _on_tf == '3m'
+            ):
+                from Trading_bot_1_core import get_tick_size as _on_tick
+
+                _on_px = (
+                    df.attrs.get('onset_px')
+                    if df is not None and hasattr(df, 'attrs')
+                    else None
+                )
+                if _on_px is None and df is not None and len(df):
+                    _on_px = df['close'].iloc[-1]
+                _on_px = (
+                    float(_on_px) if _on_px is not None else None
+                )
+
+                indicators['onset'] = dict(
+                    OnsetEngine.evaluate(
+                        symbol, OnsetFlowBook, _on_tick,
+                        onset_map_f240, px=_on_px, max_steps=5
+                    ),
+                    px_chk=_on_px,
+                    active=bool(
+                        OnsetFlowBook.enabled
+                        and OnsetFlowBook.ready
+                        and OnsetEngine.is_ready(
+                            symbol, OnsetFlowBook
+                        )
+                    ),
+                    gc_bypass=(
+                        bool(df.attrs.get('onset_gcbypass'))
+                        if df is not None and hasattr(df, 'attrs')
+                        else False
+                    )
+                )
+        except Exception as _on_e:
+            indicators['onset'] = {
+                "signal": False,
+                "why": f"오류 {_on_e}"
+            }
         
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 🔒 NUMERIC SENTINEL 정규화 (SSoT)
@@ -16730,8 +16779,49 @@ class MarketAnalyzer:
                     # _surge_take / _vol_sup_mkts / 선정 로그는 관측용으로 유지한다.
                     _surge_fill = []
 
+                    _onset_pri = []
+                    try:
+                        from Trading_bot_4_data import OnsetFlowBook as _OFB
+                        if _OFB.enabled:
+                            _OE, _omap = OnsetEngine, onset_map_f240
+                            from Trading_bot_1_core import get_tick_size as _on_tick
+                            _on_rgs = {
+                                x.strip()
+                                for x in str(self.config.get(
+                                    'ONSET', 'regimes', fallback='ALL'
+                                )).split(',')
+                                if x.strip()
+                            }
+                            _on_rc = (
+                                getattr(
+                                    self, '_stable_regime_by_symbol', None
+                                ) or {}
+                            )
+                            _onset_pri = [
+                                s for s in _OE.scan(_OFB, _on_tick, _omap)
+                                if s in _valid_mini_set
+                                and (
+                                    'ALL' in _on_rgs
+                                    or _on_rc.get(s) is None
+                                    or getattr(
+                                        _on_rc.get(s), 'value',
+                                        str(_on_rc.get(s))
+                                    ) in _on_rgs
+                                )
+                            ]
+                            if _onset_pri:
+                                logger.info(
+                                    f"🧲 [ONSET-SELECT] 후보 사건 "
+                                    f"{_onset_pri} → 2차 선정 맨 앞"
+                                )
+                    except Exception as _on_e:
+                        logger.warning(
+                            f"[ONSET] 2차 선정 훑기 실패: {_on_e}"
+                        )
+
                     candidates_markets = list(dict.fromkeys(
-                        _mini_core_priority
+                        _onset_pri
+                        + _mini_core_priority
                         + _vol_fill
                         + _surge_fill
                     ))[:_target_count]
@@ -20177,4 +20267,1271 @@ class MarketAnalyzer:
             logger.error(f"시장 요약 오류: {e}")
             return {}
         
+import time
+import threading
+from collections import deque
+
+
+SC_OLD = [
+    (2000000.0, 1000), (1000000.0, 500), (500000.0, 100),
+    (100000.0, 50), (50000.0, 10), (10000.0, 10),
+    (5000.0, 1), (1000.0, 1), (100, 0.1), (10, 0.01),
+    (1, 0.001), (0.1, 0.0001), (0.01, 1e-05),
+    (0.001, 1e-06), (0.0001, 1e-07), (1e-05, 1e-08)
+]
+SC_T2 = {
+    'ADA', 'ALGO', 'BLUR', 'CELO', 'ELF', 'EOS', 'GRS', 'GRT',
+    'ICX', 'MANA', 'MINA', 'POL', 'SAND', 'SEI', 'STG', 'TRX'
+}
+SC_CHG = pd.Timestamp('2025-07-31 02:00')
+SC_CHG0 = pd.Timestamp('2024-01-29 00:45')
+SC_USD_HALF0 = pd.Timestamp('2025-03-21')
+
+
+def SC__old(p):
+    for lo, tk in SC_OLD:
+        if p >= lo:
+            return float(tk)
+    return 1e-08
+
+
+def SC_tick_asof(sym, p, ts):
+    s = sym[4:]
+    if ts >= SC_CHG:
+        return float(get_tick_size(p))
+    if (
+        s in ('USDT', 'USDC')
+        and ts >= SC_USD_HALF0
+        and 1000.0 <= p < 10000.0
+    ):
+        return 0.5
+    if ts < SC_CHG0:
+        if p >= 10000.0:
+            return SC__old(p)
+        if p >= 1000.0:
+            return 5.0
+        if p < 0.1:
+            return 0.0001
+        return SC__old(p) * 10
+    if (
+        s in SC_T2
+        and ts >= pd.Timestamp('2024-10-14')
+        and 100 <= p < 1000
+    ):
+        return 1.0
+    return SC__old(p)
+
+
+def SC_atr14(h, l, c):
+    pc = np.r_[c[0], c[:-1]]
+    tr = np.maximum(
+        h - l, np.maximum(abs(h - pc), abs(l - pc))
+    )
+    return pd.Series(tr).rolling(
+        14, min_periods=14
+    ).mean().to_numpy()
+
+
+def SC_zz_lows(h, l, rev):
+    out = []
+    mode = 0
+    hi_i, hi = 0, h[0]
+    lo_i, lo = 0, l[0]
+
+    for i in range(len(h)):
+        r = rev[i]
+        if not r > 0:
+            continue
+
+        if mode == 0:
+            if h[i] >= hi:
+                hi_i, hi = i, h[i]
+            if l[i] <= lo:
+                lo_i, lo = i, l[i]
+            if hi - lo >= r:
+                if lo_i < hi_i:
+                    out.append((lo_i, lo, i))
+                    mode = 1
+                elif hi_i < lo_i:
+                    mode = -1
+            continue
+
+        if mode == 1:
+            if h[i] >= hi:
+                hi_i, hi = i, h[i]
+            if hi_i < i and l[i] <= hi - r:
+                mode = -1
+                lo_i, lo = i, l[i]
+        else:
+            if l[i] <= lo:
+                lo_i, lo = i, l[i]
+            if lo_i < i and h[i] >= lo + r:
+                out.append((lo_i, lo, i))
+                mode = 1
+                hi_i, hi = i, h[i]
+
+    return out
+
+
+def SC_zz_highs(h, l, rev):
+    return [
+        (p, -v, k)
+        for p, v, k in SC_zz_lows(-l, -h, rev)
+    ]
+
+
+class SC_ZoneBook:
+    def __init__(self):
+        self.z = {}
+        self.active = {}
+        self.nid = 0
+        self.hist = []
+        self.dead = set()
+        self.dead_bounds = []
+
+    def update(self, clusters, known_t, band):
+        for lo, hi, s, members, k2 in clusters:
+            members = [m for m in members if m not in self.dead]
+            if len(members) < 2:
+                continue
+
+            hit = [
+                zid for zid, Z in self.active.items()
+                if not (hi < Z['lo0'] or lo > Z['hi0'])
+            ]
+            if hit:
+                zid = min(hit)
+                Z = self.z[zid]
+                for other in hit[1:]:
+                    O = self.z[other]
+                    Z['members'] |= O['members']
+                    self.kill(
+                        other, ('merge', known_t, other, zid),
+                        dead=False
+                    )
+                Z['path'] += abs(
+                    (lo + hi) / 2 - (Z['lo'] + Z['hi']) / 2
+                )
+                Z['lo'] = lo
+                Z['hi'] = hi
+                Z['members'] |= set(members)
+                Z['s'] = s
+                Z['upd'] = known_t
+            else:
+                rb = any(
+                    known_t - kt <= 960
+                    and not (hi < a or lo > b)
+                    for a, b, kt in self.dead_bounds[-50:]
+                )
+                Z = dict(
+                    lo=lo, hi=hi, lo0=lo, hi0=hi, s=s,
+                    members=set(members), born=k2,
+                    upd=known_t, alive=True,
+                    mid0=(lo + hi) / 2, path=0.0,
+                    reborn=rb, flipped=False
+                )
+                self.z[self.nid] = Z
+                self.active[self.nid] = Z
+                self.hist.append(('new', known_t, self.nid))
+                self.nid += 1
+
+    def add(self, lo, hi, known_t):
+        Z = dict(
+            lo=lo, hi=hi, lo0=lo, hi0=hi, s=0,
+            members=set(), born=known_t, upd=known_t,
+            alive=True, mid0=(lo + hi) / 2, path=0.0,
+            reborn=False, flipped=True
+        )
+        self.z[self.nid] = Z
+        self.active[self.nid] = Z
+        self.hist.append(('flip_in', known_t, self.nid))
+        self.nid += 1
+        return self.nid - 1
+
+    def kill(self, zid, rec, dead=True, keep=()):
+        Z = self.z[zid]
+        if Z['alive']:
+            Z['alive'] = False
+            self.active.pop(zid, None)
+            self.hist.append(rec)
+            if dead:
+                self.dead |= Z['members'] - set(keep)
+                self.dead_bounds.append(
+                    (Z['lo'], Z['hi'], int(rec[1]))
+                )
+
+    def alive(self):
+        return dict(self.active)
+
+
+def SC_alive_pivots(pivs, j, dead, n):
+    out = []
+    k = j - 1
+    while k >= 0 and len(out) < n and k >= j - 5 * n:
+        if pivs[k][0] not in dead:
+            out.append(pivs[k])
+        k -= 1
+    return out[::-1]
+
+
+HT_OFFSET_MIN = {15: 0, 60: 0, 240: 60}
+
+
+def HT_htf_bars(tt, h, l, c, v, tf):
+    tt = pd.DatetimeIndex(tt)
+    off = pd.Timedelta(minutes=HT_OFFSET_MIN[tf])
+    key = (tt - off).floor('%dmin' % tf) + off
+    g = pd.DataFrame(dict(
+        k=key, h=h, l=l, c=c, v=v, i=np.arange(len(tt))
+    )).groupby('k', sort=True)
+    hb = pd.DataFrame(dict(
+        h=g.h.max(), l=g.l.min(), c=g.c.last(),
+        v=g.v.sum(), n3=g.size(),
+        i0=g.i.min(), i1=g.i.max() + 1
+    ))
+    hb['ih'] = g.apply(
+        lambda x: int(x.i.iloc[int(np.argmax(x.h.to_numpy()))]),
+        include_groups=False
+    )
+    hb['il'] = g.apply(
+        lambda x: int(x.i.iloc[int(np.argmin(x.l.to_numpy()))]),
+        include_groups=False
+    )
+    hb['start'] = hb.index
+    hb['end'] = hb.start + pd.Timedelta(minutes=tf)
+    hb['full'] = hb.n3 == tf // 3
+    return hb.reset_index(drop=True)
+
+
+def HT_htf_pivots(tt, h, l, c, v, tf, k):
+    hb = HT_htf_bars(tt, h, l, c, v, tf)
+    H = hb.h.to_numpy(float)
+    Lw = hb.l.to_numpy(float)
+    C = hb.c.to_numpy(float)
+    a = np.r_[np.nan, SC_atr14(H, Lw, C)[:-1]]
+    tt = pd.DatetimeIndex(tt)
+    tv = tt.values
+
+    def conv(piv, hi):
+        out = []
+        for p, price, kn in piv:
+            j = int(np.searchsorted(
+                tv, np.datetime64(hb.end.iloc[kn]), 'left'
+            ))
+            if j >= len(tt):
+                continue
+            occ = int(
+                hb.ih.iloc[p] if hi else hb.il.iloc[p]
+            )
+            out.append((occ, float(price), j - 1))
+        return out
+
+    return (
+        conv(SC_zz_lows(H, Lw, k * a), False),
+        conv(SC_zz_highs(H, Lw, k * a), True)
+    )
+
+
+def L4_chain(pv, band):
+    pv = sorted(pv, key=lambda x: x[1])
+    gs = [[pv[0]]] if pv else []
+    for p in pv[1:]:
+        if (
+            p[1] - gs[-1][-1][1] <= band
+            and p[1] - gs[-1][0][1] <= 3 * band
+        ):
+            gs[-1].append(p)
+        else:
+            gs.append([p])
+    return gs
+
+
+def L4_clusters(method, lows, highs, l, h, c, v, band, t):
+    if len(lows) < 2:
+        return []
+
+    out = []
+    if method in ('D8', 'D8V', 'D12', 'DW', 'DT'):
+        for gp in L4_chain(lows, band):
+            if len(gp) < 2:
+                continue
+            lo = min(x[1] for x in gp)
+            hi = max(max(x[1] for x in gp), lo + band)
+            k2 = sorted(x[2] for x in gp)[1]
+            mem = [x[0] for x in gp]
+            out.append((lo, hi, len(gp), mem, k2))
+        return out
+
+    if method == 'D11':
+        allp = lows + highs
+        pr = np.array([x[1] for x in allp])
+        wd = max(0.05 * (pr.max() - pr.min()), band)
+        s0 = min(x[0] for x in allp)
+        cand = []
+
+        for p in pr:
+            lo, hi = p, p + wd
+            nlow = [x for x in lows if lo <= x[1] <= hi]
+            if len(nlow) < 2:
+                continue
+            inn = sum(1 for x in allp if lo <= x[1] <= hi)
+            touch = int(
+                ((l[s0:t] <= hi) & (h[s0:t] >= lo)).sum()
+            )
+            cand.append((
+                lo, hi, inn * 20 + touch,
+                [x[0] for x in nlow],
+                sorted(x[2] for x in nlow)[1]
+            ))
+
+        cand.sort(key=lambda x: -x[2])
+        used = []
+        for cd in cand:
+            if all(
+                cd[1] < u[0] or cd[0] > u[1]
+                for u in used
+            ):
+                used.append(cd)
+            if len(used) >= 6:
+                break
+        return used
+
+    return []
+
+
+V5_FLIPFIX = True
+
+
+def V5_rebreak_at(c, inv_at, his, band, t1):
+    rb = np.full(len(inv_at), 10 ** 12, dtype=np.int64)
+    if not V5_FLIPFIX:
+        return rb
+
+    for q in np.flatnonzero(np.asarray(inv_at) < t1):
+        j0 = int(inv_at[q])
+        jj = np.flatnonzero(c[j0:t1] > his[q] + band)
+        if len(jj):
+            rb[q] = j0 + int(jj[0]) + 1
+    return rb
+
+
+def V5_htf_inputs(tt, h, l, c, v, tf):
+    hb = HT_htf_bars(tt, h, l, c, v, tf)
+    a = np.r_[
+        np.nan,
+        SC_atr14(
+            hb.h.to_numpy(float),
+            hb.l.to_numpy(float),
+            hb.c.to_numpy(float)
+        )[:-1]
+    ]
+    ah3 = np.full(len(c), np.nan)
+    for k, (i0, i1) in enumerate(zip(
+        hb.i0.to_numpy(), hb.i1.to_numpy()
+    )):
+        ah3[i0:i1] = a[k]
+
+    SRC = {
+        sn: HT_htf_pivots(tt, h, l, c, v, tf, k_)
+        for sn, k_ in (('ZZ2', 2), ('ZZ4', 4))
+    }
+    return SRC, ah3
+
+
+class M3_ZB3(SC_ZoneBook):
+    def update(self, clusters, known_t, band, basis=None):
+        n0 = self.nid
+        super().update(clusters, known_t, band)
+
+        for k in range(n0, self.nid):
+            if k in self.z and 'made' not in self.z[k]:
+                self.z[k]['made'] = known_t
+                self.z[k]['basis_made'] = basis
+
+        for lo, hi, s, members, k2 in clusters:
+            mem = {m for m in members if m not in self.dead}
+            for Z in self.active.values():
+                if (
+                    Z['lo'] == lo and Z['hi'] == hi
+                    and Z['upd'] == known_t
+                ):
+                    Z['mem_last'] = mem
+                    Z['basis_upd'] = basis
+
+
+def M3_cl(m, lw, hw, l, h, c, v, band, t0):
+    return L4_clusters(m, lw, hw, l, h, c, v, band, t0)
+
+
+def M3_build_map_full(
+    sym, d, SRC_sn, band_atr,
+    sup_m='D11', res_m='D8', N=20
+):
+    h, l, c, v = (
+        d[k].to_numpy(float)
+        for k in ('high', 'low', 'close', 'volume')
+    )
+    tt = pd.to_datetime(d.time_kst)
+    n = len(c)
+    tnp = tt.to_numpy()
+    a1 = np.r_[np.nan, SC_atr14(h, l, c)[:-1]]
+
+    LO = sorted(SRC_sn[0], key=lambda x: x[2])
+    HI = sorted(SRC_sn[1], key=lambda x: x[2])
+    kl = np.array([x[2] for x in LO], int)
+    kh = np.array([x[2] for x in HI], int)
+    PR = {p_: v_ for p_, v_, k_ in LO + HI}
+    ZB = M3_ZB3()
+    RB = M3_ZB3()
+    lpr = {p_: v_ for p_, v_, k_ in LO}
+    hpr = {p_: v_ for p_, v_, k_ in HI}
+    segs = []
+    chg = np.unique(np.r_[200, kl + 1, kh + 1, n - 2])
+    chg = chg[(chg >= 200) & (chg <= n - 2)]
+
+    def zd(zid, Z, fl):
+        return dict(
+            id=int(zid),
+            lo=float(Z['lo']),
+            hi=float(Z['hi']),
+            born=int(Z['born']),
+            upd=int(Z['upd']),
+            made=int(Z.get('made', Z['upd'])),
+            members=sorted(
+                (int(mm), float(PR.get(mm, np.nan)))
+                for mm in Z['members']
+            ),
+            last=sorted(
+                (int(mm), float(PR.get(mm, np.nan)))
+                for mm in Z.get('mem_last', set())
+            ),
+            basis_made=Z.get('basis_made'),
+            basis_upd=Z.get('basis_upd'),
+            flipped=bool(fl or Z.get('flipped', False))
+        )
+
+    for t0, t1 in zip(chg[:-1], chg[1:]):
+        if not a1[t0] > 0 or not band_atr[t0] > 0:
+            continue
+
+        tk0 = SC_tick_asof(
+            sym, c[t0 - 1], pd.Timestamp(tnp[t0])
+        )
+        band = max(0.5 * band_atr[t0], 2 * tk0)
+        j1 = int(np.searchsorted(kl, t0 - 1, 'right'))
+        j2 = int(np.searchsorted(kh, t0 - 1, 'right'))
+        lw = SC_alive_pivots(LO, j1, ZB.dead, N)
+        hw = SC_alive_pivots(HI, j2, RB.dead, N)
+        pr = [x[1] for x in lw + hw]
+
+        if sup_m == 'D11':
+            bs = (
+                '범위 5 %'
+                if pr and 0.05 * (max(pr) - min(pr)) > band
+                else '띠',
+                0.05 * (max(pr) - min(pr)) if pr else np.nan,
+                band
+            )
+        else:
+            bs = '띠 (묶음)', np.nan, band
+
+        cs = M3_cl(
+            sup_m, lw, hw, l, h, c, v, band, t0
+        )
+        if cs and cs[0] == ('skip400',):
+            cs = []
+        ZB.update(cs, t0, band, bs)
+
+        cr = (
+            M3_cl(res_m, hw, [], l, h, c, v, band, t0)
+            if len(hw) >= 2 else []
+        )
+        RB.update(cr, t0, band, ('저항 ' + res_m, np.nan, band))
+
+        al = ZB.alive()
+        ar = RB.alive()
+        if not al and not ar:
+            continue
+
+        ids = list(al)
+        los = np.array([al[i]['lo'] for i in ids])
+        his = np.array([al[i]['hi'] for i in ids])
+        rids = list(ar)
+        rhis = np.array([ar[i]['hi'] for i in rids])
+        seg_c = c[t0:t1]
+        cm = np.minimum.accumulate(seg_c)
+        cx = np.maximum.accumulate(seg_c)
+
+        inv_at = (
+            np.where(
+                np.searchsorted(
+                    -cm, -(los - band), side='right'
+                ) < len(cm),
+                t0 + np.searchsorted(
+                    -cm, -(los - band), side='right'
+                ) + 1,
+                10 ** 12
+            )
+            if len(ids) else np.array([], int)
+        )
+        bo_at = (
+            np.where(
+                np.searchsorted(
+                    cx, rhis + band, side='right'
+                ) < len(cx),
+                t0 + np.searchsorted(
+                    cx, rhis + band, side='right'
+                ) + 1,
+                10 ** 12
+            )
+            if len(rids) else np.array([], int)
+        )
+        rb_at = (
+            V5_rebreak_at(c, inv_at, his, band, t1)
+            if len(ids) else np.array([], int)
+        )
+
+        segs.append((
+            int(t0), int(t1),
+            [zd(i, al[i], False) for i in ids],
+            inv_at,
+            [zd(i, ar[i], False) for i in rids],
+            bo_at, band, rb_at
+        ))
+
+        for k in range(len(rids)):
+            if bo_at[k] <= t1:
+                cb = c[int(bo_at[k] - 1)]
+                RB.kill(
+                    rids[k],
+                    ('broken_up', int(bo_at[k] - 1), int(rids[k])),
+                    keep={
+                        mm for mm in ar[rids[k]]['members']
+                        if cb <= hpr.get(mm, -np.inf) + band
+                    }
+                )
+
+        for k in range(len(ids)):
+            if inv_at[k] <= t1:
+                cb = c[int(inv_at[k] - 1)]
+                ZB.kill(
+                    ids[k],
+                    ('broken_flip', int(inv_at[k] - 1), int(ids[k])),
+                    keep={
+                        mm for mm in al[ids[k]]['members']
+                        if cb >= lpr.get(mm, np.inf) - band
+                    }
+                )
+                if rb_at[k] > t1:
+                    RB.add(
+                        float(los[k]), float(his[k]),
+                        int(inv_at[k])
+                    )
+
+    return segs
+
+
+def BP_build(mp, sym, d, tt, h, l, c, v, a1):
+    dd = d.drop(columns=['open'])
+    if mp == 'M3':
+        return M3_build_map_full(
+            sym, dd,
+            (
+                SC_zz_lows(h, l, 4 * a1),
+                SC_zz_highs(h, l, 4 * a1)
+            ),
+            a1, 'D11', 'D8', 20
+        )
+    SRC, ah3 = V5_htf_inputs(
+        tt, h, l, c, v, int(mp[1:])
+    )
+    return M3_build_map_full(
+        sym, dd, SRC['ZZ2'], ah3, 'D11', 'D8', 10
+    )
+
+
+def CF_compact(MP):
+    t0s = np.array([g[0] for g in MP], int)
+    t1s = np.array([g[1] for g in MP], int)
+    segs = []
+    for t0, t1, sup, inv, res, bo, band, rb in MP:
+        segs.append((
+            np.array([z['lo'] for z in sup], float),
+            np.array([z['hi'] for z in sup], float),
+            np.asarray(inv, np.int64),
+            np.asarray(rb, np.int64),
+            np.array([z['lo'] for z in res], float),
+            np.array([z['hi'] for z in res], float),
+            np.asarray(bo, np.int64)
+        ))
+    return t0s, t1s, segs
+
+
+def CF_alive_c(C, s):
+    t0s, t1s, segs = C
+    k = int(np.searchsorted(t0s, s, 'right')) - 1
+    if k < 0 or not t0s[k] <= s < t1s[k]:
+        return [], []
+
+    sl, sh, inv, rb, rl, rh, bo = segs[k]
+    ms = inv > s
+    mf = (inv <= s) & (s < rb)
+    mr = bo > s
+    return (
+        list(zip(sl[ms], sh[ms])),
+        list(zip(rl[mr], rh[mr])) + list(zip(sl[mf], sh[mf]))
+    )
+
+
+def onset_f240(sym, d, e):
+    ci = len(d)
+    lc = float(d.close.iat[-1])
+    t0 = pd.Timestamp(d.time_kst.iat[-1])
+    pad = pd.DataFrame(dict(
+        time_kst=[
+            (t0 + pd.Timedelta(minutes=3 * k)).strftime(
+                '%Y-%m-%dT%H:%M:%S'
+            )
+            for k in (1, 2, 3)
+        ],
+        open=lc, high=lc, low=lc, close=lc, volume=0.0
+    ))
+    d = pd.concat([
+        d[['time_kst', 'open', 'high', 'low', 'close', 'volume']],
+        pad
+    ], ignore_index=True)
+
+    o, h, l, c, v = (
+        d[x].to_numpy(float)
+        for x in ('open', 'high', 'low', 'close', 'volume')
+    )
+    a1 = np.r_[np.nan, SC_atr14(h, l, c)[:-1]]
+    tt = pd.to_datetime(d.time_kst)
+    C3 = CF_compact(BP_build(
+        'M3', sym, d, tt, h, l, c, v, a1
+    ))
+    C4 = CF_compact(BP_build(
+        'H240', sym, d, tt, h, l, c, v, a1
+    ))
+    s3, _ = CF_alive_c(C3, ci)
+    s4, _ = CF_alive_c(C4, ci)
+    bel = [
+        (a, b) for a, b in s3
+        if a <= e and b <= e * (1 + 1e-09)
+    ] or [
+        (a, b) for a, b in s3 if a <= e
+    ]
+    if not bel:
+        return -1
+    a, b = max(bel, key=lambda z: z[1])
+    return int(any(x <= b and y >= a for x, y in s4))
+
+
+W7 = 3360
+DAYB = 480
+NKEEP = W7 + 2
+ND = 6
+
+
+def _median(x):
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    return float(np.median(x)) if len(x) else math.nan
+
+
+class OnsetState:
+    def __init__(self, tick_fn):
+        self.tick_fn = tick_fn
+        self.flow = {}
+        self.V15 = deque(maxlen=NKEEP)
+        self.S15 = deque(maxlen=NKEEP)
+        self.V60q = deque(maxlen=NKEEP)
+        self.shr = deque(maxlen=NKEEP)
+        self.sbin = deque(maxlen=NKEEP)
+        self.dtk = deque(maxlen=NKEEP)
+        self.cl = deque(maxlen=40)
+        self.hi = deque(maxlen=40)
+        self.lo = deque(maxlen=40)
+        self.tr = deque(maxlen=14)
+        self.tk = deque(maxlen=40)
+        self.armed = True
+        self.endc = 0
+        self.n = 0
+        self.last_s = None
+        self.why = ''
+
+    def add_trade(self, bar, recv_bar, val, is_buy):
+        d = min(max(recv_bar - bar, 0), ND - 1)
+        row = self.flow.get(bar)
+        if row is None:
+            row = self.flow[bar] = np.zeros((ND, 3))
+        row[d, 0] += val
+        row[d, 1 if is_buy else 2] += val
+
+    def add_bin(self, bar, d, val, buy, sell):
+        if d >= ND:
+            return
+        row = self.flow.get(bar)
+        if row is None:
+            row = self.flow[bar] = np.zeros((ND, 3))
+        row[d, 0] += val
+        row[d, 1] += buy
+        row[d, 2] += sell
+
+    def _win(self, s, j0, j1, col):
+        total = 0.0
+        for j in range(j0, j1 + 1):
+            row = self.flow.get(s - j)
+            if row is not None:
+                total += row[:min(j, 5) + 1, col].sum()
+        return total
+
+    def step(self, s, h, l, c):
+        if self.last_s is not None and s != self.last_s + 1:
+            raise ValueError(
+                '격자 건너뜀 %s → %s' % (self.last_s, s)
+            )
+        self.last_s = s
+        pc = self.cl[-1] if self.cl else c
+        self.tr.append(max(h - l, abs(h - pc), abs(l - pc)))
+        self.cl.append(c)
+        self.hi.append(h)
+        self.lo.append(l)
+
+        try:
+            self.tk.append(
+                float(self.tick_fn(c)) if c > 0 else math.nan
+            )
+        except Exception:
+            self.tk.append(math.nan)
+
+        atr = (
+            float(np.mean(self.tr))
+            if len(self.tr) == 14 else math.nan
+        )
+        V15 = self._win(s, 0, 4, 0)
+        B15 = self._win(s, 0, 4, 1)
+        S15 = self._win(s, 0, 4, 2)
+        V60q = self._win(s, 5, 24, 0)
+        hv15 = np.asarray(self.V15, float)[-W7:]
+        hs15 = np.asarray(self.S15, float)[-W7:]
+        hshr = np.asarray(self.shr, float)[-W7:]
+        full = len(hv15) >= W7
+
+        q80 = (
+            float(np.quantile(hv15, 0.8))
+            if len(hv15) >= W7 // 2 else math.nan
+        )
+        shm = (
+            float(np.median(hshr[np.isfinite(hshr)]))
+            if np.isfinite(hshr).sum() >= W7 // 2
+            else math.nan
+        )
+        smed = (
+            float(np.median(hs15))
+            if len(hs15) >= W7 // 2 else math.nan
+        )
+
+        allv = np.asarray(self.V15, float)
+        allq = np.asarray(self.V60q, float)
+        nl = len(allv)
+
+        def tod(hist):
+            values = [
+                hist[nl - DAYB * k]
+                for k in range(1, 8)
+                if nl - DAYB * k >= 0
+            ]
+            return _median(values) if values else math.nan
+
+        qmed = tod(allq)
+        emed = tod(allv)
+        strg = (
+            S15 / smed
+            if np.isfinite(smed) and smed > 0
+            else math.nan
+        )
+        sb = (
+            3 if strg >= 4 else
+            2 if strg >= 2 else
+            1 if strg >= 1 else 0
+        )
+
+        if len(self.cl) >= 6:
+            p6 = self.cl[-6]
+            lo5 = min(list(self.lo)[-5:])
+            tk5 = self.tk[-6]
+            dk = (
+                max((p6 - lo5) / tk5, 0.0)
+                if np.isfinite(tk5) and tk5 > 0
+                else math.nan
+            )
+        else:
+            p6 = math.nan
+            dk = math.nan
+
+        qhi = (
+            max(list(self.hi)[-25:-5])
+            if len(self.hi) >= 25 else math.nan
+        )
+        ev = None
+
+        if not full:
+            why = '데우기'
+        elif not self.armed:
+            self.endc = (
+                self.endc + 1
+                if np.isfinite(emed) and V15 <= emed
+                else 0
+            )
+            if self.endc >= 3:
+                self.armed = True
+                self.endc = 0
+            why = '사건 뒤 쉼'
+        elif not (
+            np.isfinite(qmed) and np.isfinite(q80)
+            and np.isfinite(shm) and np.isfinite(atr)
+        ):
+            why = '기준 없음'
+        elif not (
+            V60q <= qmed and V15 >= q80
+            and V15 > 0 and B15 / V15 >= shm
+        ):
+            why = '켜짐 아님'
+        elif not (
+            c <= p6 * (1 + 0.5 * atr / c) and c < qhi
+        ):
+            why = '가격 이미 오름'
+        elif S15 <= 0:
+            why = '매도 없음'
+        elif not smed > 0:
+            why = '기준 0'
+        elif strg < 1:
+            why = '흡수 아님 (매도 약함)'
+        else:
+            hb = np.asarray(self.sbin, float)[-W7:]
+            hd = np.asarray(self.dtk, float)[-W7:]
+            hv = hd[(hb == sb) & np.isfinite(hd)]
+            if len(hv) < 20:
+                why = '기준 없음'
+            elif not dk <= float(np.median(hv)):
+                why = '흡수 아님 (많이 밀림)'
+            else:
+                ev = dict(
+                    s=s, strg=strg, dtk=dk,
+                    dmed=float(np.median(hv)),
+                    shr=B15 / V15, close=c
+                )
+                why = '사건'
+
+        self.V15.append(V15)
+        self.S15.append(S15)
+        self.V60q.append(V60q)
+        self.shr.append(B15 / V15 if V15 > 0 else math.nan)
+        self.sbin.append(sb)
+        self.dtk.append(dk)
+
+        for k in [k for k in self.flow if k < s - 30]:
+            self.flow.pop(k, None)
+
+        self.n += 1
+        self.why = why
+        return ev
+
+    def mark_taken(self, taken):
+        if taken:
+            self.armed = False
+            self.endc = 0
+
+
+MAX_LATE_SEC = 90
+MAP_DAYS = 60
+WARM_BARS = 25
+CATCHUP_CHUNK = 200
+MAX_STEPS = 100
+
+
+class OnsetEngine:
+    _st = {}
+    _next = {}
+    _last_close = {}
+    _pend = {}
+    _cand = {}
+    _lock = threading.RLock()
+    _thr = None
+    _re_t = 0.0
+
+    @classmethod
+    def evaluate(
+        cls, market, flow_book, tick_fn, map_fn,
+        now=None, px=None, max_steps=MAX_STEPS
+    ):
+        with cls._lock:
+            return cls._evaluate(
+                market, flow_book, tick_fn, map_fn,
+                now, px, max_steps
+            )
+
+    @classmethod
+    def is_ready(cls, market, flow_book, now=None):
+        now = time.time() if now is None else now
+        s_last = int((int(now) + 32400) // 180) - 1
+
+        with cls._lock:
+            nx = cls._next.get(market)
+            st = cls._st.get(market)
+            full = st is not None and len(st.V15) >= W7
+
+        lf = (
+            flow_book.bars(market)[2]
+            if getattr(flow_book, 'ready', False)
+            else None
+        )
+        return bool(
+            full and nx is not None and nx > s_last - 1
+            and lf is not None
+            and s_last >= lf + WARM_BARS
+        )
+
+    @classmethod
+    def candidates(cls):
+        with cls._lock:
+            return list(cls._cand)
+
+    @classmethod
+    def _catchup(cls, flow_book, tick_fn, map_fn, order=None):
+        t0 = time.time()
+        done = 0
+        try:
+            order = (
+                order if order is not None else
+                sorted(
+                    flow_book.symbols,
+                    key=lambda m: -len(flow_book.bars(m)[0])
+                )
+            )
+            for m in order:
+                try:
+                    while True:
+                        r = cls.evaluate(
+                            m, flow_book, tick_fn, map_fn,
+                            max_steps=CATCHUP_CHUNK
+                        )
+                        time.sleep(0.002)
+                        if not str(r.get('why', '')).startswith(
+                            '따라잡는 중'
+                        ):
+                            break
+                except Exception as e:
+                    logger.warning(
+                        f'[ONSET] 따라잡기 {m} 오류 (건너뜀): {e}'
+                    )
+                done += 1
+                if done % 50 == 0:
+                    logger.info(
+                        f'🧲 [ONSET] 따라잡기 {done}/{len(order)} '
+                        f'종목 · {time.time() - t0:.0f}초'
+                    )
+            logger.info(
+                f'🧲 [ONSET] 따라잡기 끝 · 종목 {len(order)} · '
+                f'{time.time() - t0:.0f}초'
+            )
+        except Exception as e:
+            logger.warning(f'[ONSET] 따라잡기 스레드 오류: {e}')
+
+    @classmethod
+    def _evaluate(
+        cls, market, flow_book, tick_fn, map_fn,
+        now=None, px=None, max_steps=MAX_STEPS
+    ):
+        now = time.time() if now is None else now
+        t_call = time.time()
+        cur = int((int(now) + 32400) // 180)
+        s_last = cur - 1
+
+        if not getattr(flow_book, 'ready', False):
+            return dict(signal=False, why='미리 채우기 전')
+
+        flow, ohlc, live_from = flow_book.bars(market)
+        if not flow or not ohlc:
+            return dict(signal=False, why='체결 기록 없음')
+
+        st = cls._st.get(market)
+        if st is None:
+            st = cls._st[market] = OnsetState(tick_fn)
+            cls._next[market] = min(flow)
+
+        ev_out = None
+        s = cls._next[market]
+        n_step = 0
+
+        while s <= s_last and n_step < max_steps:
+            for j in range(6):
+                row = flow.get(s - j)
+                if row is not None:
+                    st.flow[s - j] = np.asarray(row, float)
+
+            o = ohlc.get(s)
+            if o is not None:
+                h, l, c = o[1], o[2], o[3]
+                cls._last_close[market] = c
+            else:
+                c = cls._last_close.get(market)
+                if c is None:
+                    s += 1
+                    continue
+                h = l = c
+
+            if st.last_s is not None and s != st.last_s + 1:
+                st = cls._st[market] = OnsetState(tick_fn)
+
+            if cls._pend.get(market) == s - 1:
+                st.mark_taken(o is not None)
+                cls._pend.pop(market, None)
+
+            ev = st.step(s, h, l, c)
+            n_step += 1
+
+            if ev is not None:
+                cls._pend[market] = s
+                warm = (
+                    live_from is None
+                    or s < live_from + WARM_BARS
+                )
+                base = dict(
+                    signal=False, bar=s,
+                    strg=ev['strg'], dtk=ev['dtk'],
+                    dmed=ev['dmed'], shr=ev['shr'],
+                    f240=None
+                )
+                if s == s_last and not warm:
+                    cls._cand[market] = dict(
+                        base,
+                        why='사건 · 다음 봉 첫 체결 기다림',
+                        px_ok={}
+                    )
+                    ev_out = None
+                else:
+                    ev_out = dict(
+                        base,
+                        why=(
+                            '사건 · 데우기' if warm
+                            else '사건 · 늦음 (따라잡기)'
+                        )
+                    )
+                logger.info(
+                    f"🧲 [ONSET] {market} 봉 {s} | "
+                    f"{'후보' if ev_out is None else ev_out['why']} | "
+                    f"매도세기 {ev['strg']:.2f} · "
+                    f"밀림 {ev['dtk']:.0f}틱 "
+                    f"(평소 {ev['dmed']:.0f}) · "
+                    f"매수몫 {ev['shr']:.2f}"
+                )
+
+            s += 1
+
+        cls._next[market] = s
+        if s <= s_last:
+            return dict(
+                signal=False, bar=s_last,
+                why='따라잡는 중 (%d 봉 남음)' % (s_last - s + 1)
+            )
+
+        c0 = cls._cand.get(market)
+        if c0 is None:
+            return (
+                ev_out
+                if ev_out is not None and ev_out['bar'] == s_last
+                else dict(signal=False, bar=s_last, why=st.why)
+            )
+
+        nb = c0['bar'] + 1
+        o = ohlc.get(nb)
+        if o is None:
+            if cur > nb:
+                cls._cand.pop(market, None)
+                logger.info(
+                    f"🧲 [ONSET] {market} 봉 {c0['bar']} | "
+                    f"사건 · 다음 봉 체결 없음"
+                )
+                return dict(c0, why='사건 · 다음 봉 체결 없음')
+            return dict(
+                c0, why='사건 · 다음 봉 첫 체결 기다림'
+            )
+
+        first_ms = (
+            o[5] if len(o) > 5
+            else (nb * 180 - 32400) * 1000.0
+        )
+        deadline = first_ms / 1000.0 + MAX_LATE_SEC
+        now_eff = lambda: now + (time.time() - t_call)
+
+        if now_eff() > deadline:
+            cls._cand.pop(market, None)
+            if c0.get('sig_seen'):
+                return dict(
+                    c0, signal=False,
+                    why='사건 · 매수 창 끝 (신호 냈음)'
+                )
+            return dict(
+                c0,
+                why='사건 · 늦음 (첫 체결 뒤 %.0f 초)'
+                % (now_eff() - first_ms / 1000.0)
+            )
+
+        key = float(o[0]), float(first_ms)
+        if c0.get('key') != key:
+            try:
+                c0['f240'] = map_fn(
+                    market, ohlc, nb, key[0], MAP_DAYS
+                )
+            except Exception as e:
+                logger.warning(f'[ONSET] {market} 지도 오류: {e}')
+                c0['f240'] = -9
+
+            c0['key'] = key
+            c0['px0'] = key[0]
+            c0['px_ok'] = {}
+
+        if c0['f240'] != 1:
+            cls._cand.pop(market, None)
+            return dict(
+                c0,
+                why='사건 · 4h 겹침 아님 (%s)' % c0['f240']
+            )
+
+        if px is not None and float(px) != c0['px0']:
+            k = float(px)
+            if k not in c0['px_ok']:
+                try:
+                    c0['px_ok'][k] = map_fn(
+                        market, ohlc, nb, k, MAP_DAYS
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f'[ONSET] {market} 지도 오류 (현재가): {e}'
+                    )
+                    c0['px_ok'][k] = -9
+            if c0['px_ok'][k] != 1:
+                return dict(
+                    c0, signal=False,
+                    why='사건 · 지금가 %s 지지 벗어남 (%s)'
+                    % (px, c0['px_ok'][k])
+                )
+
+        el = now_eff() - first_ms / 1000.0
+        if el > MAX_LATE_SEC:
+            cls._cand.pop(market, None)
+            return dict(
+                c0, signal=False,
+                why='사건 · 늦음 (판단 중 창 지남 %.1f 초)' % el
+            )
+
+        if not c0.get('sig_seen'):
+            c0['sig_seen'] = True
+            logger.info(
+                f"🧲 [ONSET] {market} 봉 {c0['bar']} | "
+                f"매수 신호 · 첫 체결 뒤 {el:.0f}초 · "
+                f"첫 체결가 {c0['px0']} · 지금가 {px}"
+            )
+
+        return dict(
+            c0, signal=True,
+            why='사건 · 4h 지지 겹침 · 매수',
+            el=el,
+            deadline=deadline - (now - t_call)
+        )
+
+    @classmethod
+    def scan(cls, flow_book, tick_fn, map_fn, now=None):
+        if (
+            not getattr(flow_book, 'enabled', False)
+            or not getattr(flow_book, 'ready', False)
+        ):
+            return []
+
+        if cls._thr is None:
+            cls._thr = threading.Thread(
+                target=cls._catchup,
+                args=(flow_book, tick_fn, map_fn),
+                name='onset-catchup',
+                daemon=True
+            )
+            cls._thr.start()
+
+        now_ = time.time() if now is None else now
+        s_last = int((int(now_) + 32400) // 180) - 1
+        lag = []
+
+        for m in sorted(flow_book.symbols):
+            with cls._lock:
+                nx = cls._next.get(m)
+
+            if nx is None or nx < s_last - 3:
+                if flow_book.bars(m)[0]:
+                    lag.append(m)
+                continue
+
+            try:
+                cls.evaluate(
+                    m, flow_book, tick_fn, map_fn,
+                    now=now, max_steps=5
+                )
+            except Exception as e:
+                logger.warning(f'[ONSET] {m} 훑기 오류: {e}')
+
+        if (
+            lag and not cls._thr.is_alive()
+            and time.time() - cls._re_t > 600
+        ):
+            cls._thr = threading.Thread(
+                target=cls._catchup,
+                args=(flow_book, tick_fn, map_fn, lag),
+                name='onset-catchup-re',
+                daemon=True
+            )
+            cls._thr.start()
+            cls._re_t = time.time()
+
+        return cls.candidates()
+
+
+def onset_map_f240(
+    market, ohlc, bar_next, entry_px, days=None
+):
+    lo = None if days is None else bar_next - days * 480
+
+    if hasattr(ohlc, 'frame'):
+        ks, A = ohlc.frame(lo, bar_next)
+        if len(ks) < 300:
+            return -1
+        d = pd.DataFrame(dict(
+            time_kst=pd.to_datetime(
+                np.asarray(ks, np.int64) * 180, unit='s'
+            ).strftime('%Y-%m-%dT%H:%M:%S'),
+            open=A[:, 0], high=A[:, 1],
+            low=A[:, 2], close=A[:, 3], volume=A[:, 4]
+        ))
+        return onset_f240(market, d, float(entry_px))
+
+    ks = sorted(
+        k for k in ohlc
+        if k < bar_next and (lo is None or k >= lo)
+    )
+    if len(ks) < 300:
+        return -1
+    rows = [ohlc[k] for k in ks]
+    d = pd.DataFrame(dict(
+        time_kst=pd.to_datetime(
+            [k * 180 for k in ks], unit='s'
+        ).strftime('%Y-%m-%dT%H:%M:%S'),
+        open=[r[0] for r in rows],
+        high=[r[1] for r in rows],
+        low=[r[2] for r in rows],
+        close=[r[3] for r in rows],
+        volume=[r[4] for r in rows]
+    ))
+    return onset_f240(market, d, float(entry_px))
+
+
 # **END**        

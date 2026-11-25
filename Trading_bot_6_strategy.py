@@ -1393,6 +1393,159 @@ class SignalAnalyzer:
                 
                 # 🔒 [WARMUP 철거-0817] 시간이 데이터 품질을 대신할 수 없다.
                 
+                _on_pre = (
+                    (getattr(data_package, "indicators", None) or {})
+                    .get("onset") or {}
+                )
+                if (
+                    _on_pre.get("gc_bypass")
+                    and self.config.getboolean(
+                        "ONSET", "enabled", fallback=False
+                    )
+                    and not (
+                        {
+                            s.strip()
+                            for s in self.config.get(
+                                "ONSET", "regimes", fallback="ALL"
+                            ).split(",")
+                            if s.strip()
+                        }
+                        & {
+                            "ALL",
+                            getattr(
+                                data_package.regime, "value",
+                                str(data_package.regime)
+                            )
+                        }
+                    )
+                ):
+                    self.last_rejection_reason = (
+                        f"ONSET 후보 · 체제 "
+                        f"{getattr(data_package.regime, 'value', data_package.regime)} "
+                        f"· 골크필터 안 거침 → GC 길 안 탐"
+                    )
+                    return None
+
+                if (
+                    self.config.getboolean(
+                        "ONSET", "enabled", fallback=False
+                    )
+                    and self.config.getboolean(
+                        "ONSET", "replace_gc_paths", fallback=True
+                    )
+                    and (
+                        {
+                            s.strip()
+                            for s in self.config.get(
+                                "ONSET", "symbols", fallback=""
+                            ).split(",")
+                            if s.strip()
+                        }
+                        & {"ALL", symbol}
+                    )
+                    and (
+                        {
+                            s.strip()
+                            for s in self.config.get(
+                                "ONSET", "regimes", fallback="ALL"
+                            ).split(",")
+                            if s.strip()
+                        }
+                        & {
+                            "ALL",
+                            getattr(
+                                data_package.regime, "value",
+                                str(data_package.regime)
+                            )
+                        }
+                    )
+                    and (
+                        (
+                            getattr(data_package, "indicators", None)
+                            or {}
+                        ).get("onset") or {}
+                    ).get("active")
+                ):
+                    _on_ind = (
+                        getattr(data_package, "indicators", None) or {}
+                    )
+                    _on = _on_ind.get("onset") or {}
+                    _px = data_package.current_price
+                    _on_rb = (
+                        self.recent_context.get(symbol, {}) or {}
+                    ).get("reentry_block_until", 0)
+
+                    if not _on.get("signal"):
+                        self.last_rejection_reason = (
+                            f"ONSET 대기 "
+                            f"({_on.get('why', '지표 없음')})"
+                        )
+                        return None
+
+                    if _on_rb and time.time() < _on_rb:
+                        self.last_rejection_reason = "ONSET · REENTRY_BLOCK"
+                        return None
+
+                    if time.time() > float(_on.get("deadline") or 0):
+                        self.last_rejection_reason = "ONSET · 매수 창 지남"
+                        return None
+
+                    if (
+                        _on_ind.get("_meta") or {}
+                    ).get("data_stale", False):
+                        self.last_rejection_reason = (
+                            "ONSET · STALE_EXEC_BLOCK"
+                        )
+                        return None
+
+                    if (
+                        _on.get("px_chk") is None
+                        or abs(float(_on["px_chk"]) - float(_px)) > 1e-9
+                    ):
+                        self.last_rejection_reason = (
+                            f"ONSET · 현재가 {_px} ≠ 지지 확인가 "
+                            f"{_on.get('px_chk')}"
+                        )
+                        return None
+
+                    logger.info(
+                        f"🧲 [ONSET-BUY] {symbol} | 가 {_px} · "
+                        f"{_on.get('why')} · 첫 체결 뒤 "
+                        f"{float(_on.get('el') or 0):.0f}초"
+                    )
+
+                    return TradingSignal(
+                        symbol=symbol,
+                        action="BUY",
+                        price=_px,
+                        confidence=0.6,
+                        reason="ONSET 흡수 초입 + 4h 지지",
+                        market_regime=data_package.regime,
+                        signal_components={
+                            "current_price": _px,
+                            "entry_type": "ONSET",
+                            "onset_bar": _on.get("bar"),
+                            "onset_strg": _on.get("strg"),
+                            "onset_dtk": _on.get("dtk")
+                        },
+                        indicators={
+                            "atr": _on_ind.get("atr", 0.0),
+                            "entry_type": "ONSET",
+                            "judges": "0000",
+                            "gajami_entry": False,
+                            "entry_stage": "STD",
+                            "position_size_ratio": 1.0,
+                            "entry_confidence": 0.6,
+                            "effective_conf_threshold": self.min_confidence,
+                            "onset": _on,
+                            "onset_deadline": _on.get("deadline"),
+                            "entry_regime": (
+                                data_package.regime.value
+                                if data_package.regime else None
+                            )
+                        }
+                    )
+
                 signal = await self._check_buy_conditions(
                     data_package, weights, performance, risk_metrics
                 )

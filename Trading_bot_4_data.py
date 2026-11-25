@@ -1212,6 +1212,458 @@ class BuyFlowBook:
             return None
 
 
+class OnsetOhlc:
+    __slots__ = ('h', 'recent')
+
+    def __init__(self, hb=None, ha=None):
+        import numpy as _np
+        self.h = (
+            hb if hb is not None else _np.zeros(0, _np.int64),
+            ha if ha is not None else _np.zeros((0, 5))
+        )
+        self.recent = {}
+
+    def _hist(self, b):
+        import numpy as _np
+        hb, ha = self.h
+        i = int(_np.searchsorted(hb, b))
+        if i < len(hb) and int(hb[i]) == b:
+            a = ha[i]
+            return [
+                float(a[0]), float(a[1]), float(a[2]),
+                float(a[3]), float(a[4]), 0.0, 0.0
+            ]
+        return None
+
+    def get(self, b, default=None):
+        r = self.recent.get(b)
+        if r is not None:
+            return r
+        r = self._hist(b)
+        return default if r is None else r
+
+    def __getitem__(self, b):
+        r = self.get(b)
+        if r is None:
+            raise KeyError(b)
+        return r
+
+    def __contains__(self, b):
+        return self.get(b) is not None
+
+    def __len__(self):
+        return len(self.h[0]) + len(self.recent)
+
+    def __bool__(self):
+        return len(self) > 0
+
+    def frame(self, lo, hi):
+        import numpy as _np
+        hb0, ha0 = self.h
+        m = hb0 < hi if lo is None else (hb0 >= lo) & (hb0 < hi)
+        hb, ha = hb0[m], ha0[m]
+        snap = list(self.recent.items())
+        rk = sorted(
+            (k, v[:5]) for k, v in snap
+            if k < hi and (lo is None or k >= lo)
+        )
+        if rk:
+            kk = _np.asarray([k for k, _ in rk], _np.int64)
+            keep = ~_np.isin(hb, kk)
+            hb = _np.concatenate([hb[keep], kk])
+            ha = _np.vstack([
+                ha[keep],
+                _np.asarray([v for _, v in rk], float)
+            ])
+            order = _np.argsort(hb, kind='mergesort')
+            hb, ha = hb[order], ha[order]
+        return hb, ha
+
+    def compact(self, now_bar, keep, recent_keep=40):
+        import numpy as _np
+        old = [
+            k for k in list(self.recent)
+            if k < now_bar - recent_keep
+        ]
+        hb, ha = self.h
+        if old:
+            hb, ha = self.frame(None, now_bar - recent_keep)
+        if len(hb) and int(hb[0]) < now_bar - keep:
+            i = int(_np.searchsorted(hb, now_bar - keep))
+            hb, ha = hb[i:], ha[i:]
+        self.h = hb, ha
+        for k in old:
+            self.recent.pop(k, None)
+
+
+class OnsetFlowBook:
+    enabled = False
+    all_mode = False
+    symbols = set()
+    KEEP_BARS = 3400
+    KEEP_OHLC = 60 * 480 + 100
+    ready = False
+    _flow = {}
+    _ohlc = {}
+    _seen = {}
+    _live_from = {}
+    _n_add = 0
+
+    @classmethod
+    def configure(cls, enabled, symbols):
+        cls.enabled = bool(enabled)
+        sy = {s.strip() for s in symbols if s and s.strip()}
+        cls.all_mode = 'ALL' in sy
+        cls.symbols = set() if cls.all_mode else sy
+
+    @staticmethod
+    def bar_of_ms(ms):
+        return int((int(ms) // 1000 + 32400) // 180)
+
+    @classmethod
+    def _add(cls, market, tbar, rbar, val, is_buy, price, qty, ts=0):
+        import numpy as _np
+        d = min(max(rbar - tbar, 0), 5)
+        fb = cls._flow.setdefault(market, {})
+        row = fb.get(tbar)
+        if row is None:
+            row = fb[tbar] = _np.zeros((6, 3))
+        row[d, 0] += val
+        row[d, 1 if is_buy else 2] += val
+
+        ob = cls._ohlc.get(market)
+        if ob is None:
+            ob = cls._ohlc[market] = OnsetOhlc()
+
+        o = ob.recent.get(tbar)
+        if o is None:
+            h = ob._hist(tbar)
+            if h is None:
+                ob.recent[tbar] = [
+                    price, price, price, price, qty, ts, ts
+                ]
+                return
+            o = ob.recent[tbar] = h
+            o[5] = o[6] = 0.0
+
+        if price > o[1]:
+            o[1] = price
+        if price < o[2]:
+            o[2] = price
+        if not ts or ts >= o[6]:
+            o[3] = price
+            o[6] = ts
+        o[4] += qty
+
+        if ts and (o[5] == 0.0 or ts < o[5]):
+            if o[5] != 0.0:
+                o[0] = price
+            o[5] = ts
+
+    @classmethod
+    def _trim(cls, market, now_bar):
+        fb = cls._flow.get(market, {})
+        if len(fb) > cls.KEEP_BARS + 50:
+            lo = now_bar - cls.KEEP_BARS
+            for k in [k for k in fb if k < lo]:
+                fb.pop(k, None)
+
+        ob = cls._ohlc.get(market)
+        if ob is not None and len(ob.recent) > 300:
+            ob.compact(now_bar, cls.KEEP_OHLC)
+
+    @classmethod
+    def on_trade(cls, data):
+        if not cls.enabled:
+            return
+        try:
+            market = data.get('code')
+            if market not in cls.symbols:
+                return
+
+            sid = data.get('sequential_id')
+            seen = cls._seen.setdefault(market, set())
+            if sid in seen:
+                return
+            seen.add(sid)
+            if len(seen) > 20000:
+                cls._seen[market] = set(sorted(seen)[-10000:])
+
+            tp = float(data['trade_price'])
+            tv = float(data['trade_volume'])
+            ts = int(data['trade_timestamp'])
+            if not (
+                math.isfinite(tp) and math.isfinite(tv)
+                and tp > 0 and tv >= 0
+            ):
+                return
+
+            rbar = cls.bar_of_ms(time.time() * 1000)
+            cls._live_from.setdefault(market, rbar)
+            cls._add(
+                market, cls.bar_of_ms(ts), rbar,
+                tp * tv, data.get('ask_bid') == 'BID', tp, tv, ts
+            )
+            cls._n_add += 1
+            if cls._n_add % 200 == 0:
+                cls._trim(market, rbar)
+        except (KeyError, TypeError, ValueError):
+            return
+
+    @staticmethod
+    def _agg(T):
+        T = T.dropna(subset=['code', 'ttms', 'tp', 'tv', 'rms'])
+        T = T.assign(
+            ttms=T.ttms.astype('int64'),
+            rms=T.rms.astype('int64'),
+            tp=T.tp.astype(float),
+            tv=T.tv.astype(float)
+        )
+        T = T.assign(
+            tbar=(T.ttms // 1000 + 32400) // 180,
+            rbar=(T.rms // 1000 + 32400) // 180
+        )
+        T = T.assign(
+            d=(T.rbar - T.tbar).clip(0, 5),
+            val=T.tp * T.tv
+        )
+        T = T.assign(
+            buy=T.val.where(T.ab == 'B', 0.0),
+            sell=T.val.where(T.ab != 'B', 0.0)
+        )
+        F = (
+            T.groupby(['code', 'tbar', 'd'], sort=False)
+            [['val', 'buy', 'sell']].sum().reset_index()
+        )
+        S = T.sort_values(
+            ['code', 'tbar', 'ttms'], kind='mergesort'
+        )
+        g = S.groupby(['code', 'tbar'], sort=False)
+        O = pd.DataFrame(dict(
+            o=g.tp.first(),
+            h=g.tp.max(),
+            l=g.tp.min(),
+            c=g.tp.last(),
+            v=g.tv.sum(),
+            fm=g.ttms.min(),
+            lm=g.ttms.max()
+        )).reset_index()
+        return O, F
+
+    @classmethod
+    def prefill(cls, raw_dir, days=61, cache_dir=None):
+        if not cls.enabled or (
+            not cls.symbols and not cls.all_mode
+        ):
+            return 0
+
+        import os
+        import pickle
+        import numpy as _np
+
+        t_start = time.time()
+        t_end = time.time()
+        now_bar = cls.bar_of_ms(t_end * 1000)
+        bar0 = cls.bar_of_ms((t_end - days * 86400) * 1000)
+        fbar0 = now_bar - cls.KEEP_BARS - 10
+        today = time.strftime('%Y%m%d', time.localtime(t_end))
+
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+
+        Os, Fs = [], []
+        n = 0
+        n_cache = 0
+
+        for k in range(days + 1, -1, -1):
+            day = time.strftime(
+                '%Y%m%d', time.localtime(t_end - k * 86400)
+            )
+            ddir = os.path.join(raw_dir, day)
+            if not os.path.isdir(ddir):
+                continue
+
+            cp = (
+                os.path.join(cache_dir, 'onset_%s.pkl' % day)
+                if cache_dir else None
+            )
+            O = F = None
+
+            if cp and day < today and os.path.exists(cp):
+                try:
+                    with open(cp, 'rb') as f:
+                        O, F, nd = pickle.load(f)
+                    if 'fm' not in O.columns:
+                        O = F = None
+                    if O is not None:
+                        n += nd
+                        n_cache += 1
+                except Exception as e:
+                    logger.warning(
+                        f'[ONSET-PREFILL] 캐시 읽기 실패 {cp}: {e}'
+                    )
+                    O = F = None
+
+            if O is None:
+                parts = []
+                for hh in range(24):
+                    for fn in (
+                        os.path.join(ddir, '%02d.csv.gz' % hh),
+                        os.path.join(ddir, '%02d.csv' % hh)
+                    ):
+                        if not os.path.exists(fn):
+                            continue
+                        try:
+                            parts.append(pd.read_csv(
+                                fn,
+                                usecols=[
+                                    'code', 'ttms', 'tp', 'tv',
+                                    'ab', 'sid', 'rms'
+                                ],
+                                on_bad_lines='skip'
+                            ))
+                        except Exception as e:
+                            logger.warning(
+                                f'[ONSET-PREFILL] 읽기 실패 {fn}: {e}'
+                            )
+                if not parts:
+                    continue
+
+                T = pd.concat(parts, ignore_index=True)
+                T = T[
+                    T.code.astype(str).str.startswith('KRW-')
+                ].drop_duplicates(['code', 'sid'])
+                nd = len(T)
+                n += nd
+                O, F = cls._agg(T)
+
+                if cp and day < today:
+                    try:
+                        with open(cp, 'wb') as f:
+                            pickle.dump((O, F, nd), f, protocol=4)
+                    except Exception as e:
+                        logger.warning(
+                            f'[ONSET-PREFILL] 캐시 쓰기 실패 {cp}: {e}'
+                        )
+
+            if not cls.all_mode:
+                O = O[O.code.isin(cls.symbols)]
+                F = F[F.code.isin(cls.symbols)]
+
+            Os.append(O[O.tbar >= bar0])
+            Fs.append(F[F.tbar >= fbar0])
+
+        if cache_dir:
+            for f in os.listdir(cache_dir):
+                if (
+                    f.startswith('onset_')
+                    and f.endswith('.pkl')
+                    and f[6:14] < time.strftime(
+                        '%Y%m%d',
+                        time.localtime(t_end - (days + 3) * 86400)
+                    )
+                ):
+                    try:
+                        os.remove(os.path.join(cache_dir, f))
+                    except Exception:
+                        pass
+
+        if Os:
+            OA = pd.concat(Os, ignore_index=True)
+            OA = OA.sort_values(
+                ['code', 'tbar', 'fm'], kind='mergesort'
+            )
+            g = OA.groupby(['code', 'tbar'], sort=False)
+            cc = (
+                OA.sort_values(
+                    ['code', 'tbar', 'lm'], kind='mergesort'
+                )
+                .groupby(['code', 'tbar'], sort=False)
+                .c.last()
+            )
+            OA = pd.DataFrame(dict(
+                o=g.o.first(),
+                h=g.h.max(),
+                l=g.l.min(),
+                v=g.v.sum()
+            )).join(cc).reset_index()
+
+            for code, g in OA.sort_values(
+                ['code', 'tbar'], kind='mergesort'
+            ).groupby('code', sort=False):
+                cls._ohlc[code] = OnsetOhlc(
+                    g.tbar.to_numpy(_np.int64),
+                    g[['o', 'h', 'l', 'c', 'v']].to_numpy(float)
+                )
+
+            FA = (
+                pd.concat(Fs, ignore_index=True)
+                .groupby(['code', 'tbar', 'd'], sort=False)
+                [['val', 'buy', 'sell']].sum().reset_index()
+            )
+            for code, g in FA.groupby('code', sort=False):
+                fb = cls._flow.setdefault(code, {})
+                for tb, d, v, b, s_ in zip(
+                    g.tbar.to_numpy(),
+                    g.d.to_numpy(),
+                    g.val.to_numpy(),
+                    g.buy.to_numpy(),
+                    g.sell.to_numpy()
+                ):
+                    row = fb.get(int(tb))
+                    if row is None:
+                        row = fb[int(tb)] = _np.zeros((6, 3))
+                    row[int(d)] = v, b, s_
+
+        if cls.all_mode:
+            cls.symbols = set(cls._flow)
+
+        cov = cls._coverage(raw_dir)
+        if cov < 0.80:
+            logger.warning(
+                f'[ONSET-PREFILL] 수집기 원본 7일 덮음 '
+                f'{cov:.0%} < 80% → ONSET 끔 (= 기존 GC 길)'
+            )
+            cls.enabled = False
+            return n
+
+        cls.ready = True
+        logger.info(
+            f'[ONSET-PREFILL] 체결 {n:,}건 · '
+            f'종목 {len(cls.symbols)} · '
+            f'체결 봉 {sum(len(b) for b in cls._flow.values()):,} · '
+            f'OHLC 봉 {sum(len(b) for b in cls._ohlc.values()):,} · '
+            f'캐시 날 {n_cache} · {time.time() - t_start:.0f}초 · '
+            f'원본 7일 덮음 {cov:.0%}'
+        )
+        return n
+
+    @staticmethod
+    def _coverage(raw_dir, hours=168):
+        import os
+        t = time.time()
+        ok = 0
+        for k in range(1, hours + 1):
+            lt = time.localtime(t - k * 3600)
+            d = os.path.join(
+                raw_dir, time.strftime('%Y%m%d', lt)
+            )
+            h = time.strftime('%H', lt)
+            ok += (
+                os.path.exists(os.path.join(d, h + '.csv.gz'))
+                or os.path.exists(os.path.join(d, h + '.csv'))
+            )
+        return ok / float(hours)
+
+    @classmethod
+    def bars(cls, market):
+        return (
+            cls._flow.get(market, {}),
+            cls._ohlc.get(market, OnsetOhlc()),
+            cls._live_from.get(market)
+        )
+
+
 class WebSocketManager:
     """WebSocket 연결 관리"""
     
@@ -1254,6 +1706,49 @@ class WebSocketManager:
             )
         except Exception:
             BuyFlowBook.enabled = False
+
+        try:
+            _on_en = (
+                bool(config.getboolean('ONSET', 'enabled', fallback=False))
+                if config and hasattr(config, 'getboolean')
+                else False
+            )
+            _on_sy = (
+                config.get('ONSET', 'symbols', fallback='')
+                if config and hasattr(config, 'get')
+                else ''
+            ).split(',')
+            _on_tf = (
+                config.get_cached('timeframe', '')
+                if config and hasattr(config, 'get_cached')
+                else ''
+            )
+            _on_tf = getattr(_on_tf, 'value', str(_on_tf))
+
+            OnsetFlowBook.configure(_on_en and _on_tf == '3m', _on_sy)
+
+            if OnsetFlowBook.enabled:
+                _raw = config.get(
+                    'ONSET', 'raw_dir',
+                    fallback=r'backtest_data\orderflow\ws\raw'
+                )
+                if not Path(_raw).is_absolute():
+                    _raw = str(Path(__file__).resolve().parent / _raw)
+
+                _cdir = config.get(
+                    'ONSET', 'cache_dir', fallback=r'cache\onset'
+                )
+                if not Path(_cdir).is_absolute():
+                    _cdir = str(Path(__file__).resolve().parent / _cdir)
+
+                OnsetFlowBook.prefill(
+                    _raw,
+                    int(config.get('ONSET', 'prefill_days', fallback='61')),
+                    cache_dir=_cdir
+                )
+        except Exception as _on_e:
+            logger.error(f"[ONSET] 설정·미리 채우기 실패 → 끔: {_on_e}")
+            OnsetFlowBook.enabled = False
     
     def is_connected(self) -> bool:
         """연결 상태 확인"""
@@ -1329,6 +1824,11 @@ class WebSocketManager:
                 {"ticket": "upbit-bot-v1.0"},
                 {"type": "ticker", "codes": list(self.markets)}
             ]
+            if OnsetFlowBook.enabled and OnsetFlowBook.symbols:
+                subscribe_format.append({
+                    "type": "trade",
+                    "codes": sorted(OnsetFlowBook.symbols)
+                })
             
             # 🔥 Candle 구독도 같이 추가
             if self._last_candle_interval and self._last_candle_markets:
@@ -1520,6 +2020,8 @@ class WebSocketManager:
                                     if trade_price is not None:
                                         self._update_intrabar_highlow(market, float(trade_price))
                         
+                        elif data.get('type') == 'trade':
+                            OnsetFlowBook.on_trade(data)
                         # ========================================
                         # 🆕 캔들 확정 메시지 처리 (Upbit 규격: candle.3m)
                         # ========================================

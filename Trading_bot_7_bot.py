@@ -2361,6 +2361,55 @@ class UnifiedTradingBot:
             else:
                 markets_to_check = []
             
+            _onset_buy = []
+            _onset_gcskip = set()
+
+            try:
+                from Trading_bot_4_data import OnsetFlowBook
+
+                if OnsetFlowBook.enabled and self.timeframe.value == "3m":
+                    from Trading_bot_5_analysis import OnsetEngine
+
+                    _on_c = set(OnsetEngine.candidates())
+                    _on_rgs = {
+                        x.strip()
+                        for x in str(self.config.get(
+                            'ONSET', 'regimes', fallback='ALL'
+                        )).split(',')
+                        if x.strip()
+                    }
+                    _on_rc = (
+                        getattr(
+                            self.analyzer, '_stable_regime_by_symbol', None
+                        ) or {}
+                    )
+                    _onset_buy = [
+                        s for s in markets_to_check
+                        if s in _on_c
+                        and s not in self.positions
+                        and (
+                            'ALL' in _on_rgs
+                            or _on_rc.get(s) is None
+                            or getattr(
+                                _on_rc.get(s), 'value',
+                                str(_on_rc.get(s))
+                            ) in _on_rgs
+                        )
+                    ]
+
+                    if _onset_buy:
+                        markets_to_check = _onset_buy + [
+                            s for s in markets_to_check
+                            if s not in _onset_buy
+                        ]
+                        logger.info(
+                            f"🧲 [ONSET-CANDIDATE] {_onset_buy} → "
+                            f"진입 체크 맨 앞 "
+                            f"(순서만 · {len(markets_to_check)}개)"
+                        )
+            except Exception as _on_e:
+                logger.warning(f"[ONSET] 후보 넣기 실패: {_on_e}")
+
             self._entry_cycle_count += 1
             
             # __SELPROV601__ ★선정 provenance — ★관측 전용 (★판정 없음)
@@ -2844,6 +2893,17 @@ class UnifiedTradingBot:
                         f"[bot7 선계산]"
                     )
                 
+                if _onset_buy:
+                    for _on_s in _onset_buy:
+                        if _on_s not in gc_passed:
+                            gc_passed.append(_on_s)
+                            _onset_gcskip.add(_on_s)
+                            gc_stats['passed'] += 1
+
+                    gc_birth_priority[:0] = [
+                        x for x in _onset_buy if x in gc_passed
+                    ]
+
                 # ⚡ [GC-PRIORITY-REORDER] GC 탄생/Watchlist 종목을 markets_to_check 맨 앞으로 승격
                 # 정석 처리: threshold/조건 변경 없음, 처리 순서만 정정
                 # dict.fromkeys()로 dedup + 삽입순서 보존 (Watchlist+신규GC 동시 트리거 케이스 안전 처리)
@@ -3007,6 +3067,13 @@ class UnifiedTradingBot:
                     
                     logger.info(f"[진입체크] {symbol} ━━━━━━━━━━━━━━")
                     
+                    if symbol in _onset_buy:
+                        df.attrs["onset_px"] = current_price
+                        df.attrs["onset_gcbypass"] = symbol in _onset_gcskip
+                    elif df is not None and hasattr(df, "attrs"):
+                        df.attrs.pop("onset_px", None)
+                        df.attrs.pop("onset_gcbypass", None)
+
                     # 지표 계산
                     try:
                         indicators = TechnicalIndicators.calculate_all_indicators(
@@ -3807,7 +3874,11 @@ class UnifiedTradingBot:
                 # 3m 최초 BUY만 봉 시작 직후 체결을 보류한다.
                 # 기존 signal을 보관하지 않고 설정된 guard 경계에서 종목을 fresh 재평가한다.
                 # PRE→STD ADDON(position != None)은 이 표본의 대상이 아니므로 제외한다.
-                if position is None and self.timeframe.value == "3m":
+                if (
+                    position is None
+                    and self.timeframe.value == "3m"
+                    and (signal.signal_components or {}).get("entry_type") != "ONSET"
+                ):
                     _bar_guard_sec = self.config.getint(
                         "POSITION_MANAGEMENT",
                         "bar_open_guard_seconds",
@@ -4482,6 +4553,18 @@ class UnifiedTradingBot:
                     _sm = signal.metadata if isinstance(getattr(signal, 'metadata', None), dict) else {}
                     request.metadata['tp_stage'] = int(_sm.get('partial_sell_stage', 0) or 0)  # [보완 v3_4 ①] 늦은 매도 체결의 단계 가산
                     request.metadata['tp_ratio'] = float(getattr(signal, 'sell_ratio', 0) or 0)
+            if (
+                request.side == 'buy'
+                and (signal.signal_components or {}).get("entry_type") == "ONSET"
+                and time.time() > float(
+                    (signal.indicators or {}).get("onset_deadline") or 0
+                )
+            ):
+                logger.info(
+                    f"🧲 [ONSET] {signal.symbol} "
+                    f"주문 직전 매수 창 지남 → 주문 안 함"
+                )
+                return False
             try:
                 response = await self.engine.execute_order(request)
             finally:

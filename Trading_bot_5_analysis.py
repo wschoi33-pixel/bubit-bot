@@ -16198,6 +16198,7 @@ class MarketAnalyzer:
             _mini_core_priority = []
             _mini_slow_priority = []
             _mini_set = set()
+            _onset_pri = []
             
             # ========================================
             # 🔒 마켓 설정 (체제별 동적 조정 제거 - SSoT 유지)
@@ -16921,7 +16922,7 @@ class MarketAnalyzer:
                 # MINI/Track2/normal 후보 자격이 있으면 기존 경로로는 그대로 들어올 수 있다.
                 # 새 상수·threshold 0개 — admission 권한만 회수.
                 result = list(dict.fromkeys(
-                    _mini_core_priority
+                    _onset_pri + _mini_core_priority
                 ))[:top_markets_count]
 
                 # 2) 남은 슬롯만 기타 보조 lane으로 보충
@@ -16984,6 +16985,10 @@ class MarketAnalyzer:
                     c['market'] for c in candidates
                     if c.get('market') and self._mini_constitution_pre_ok(c['market'])[0]
                 ][:top_markets_count]
+                if _onset_pri:
+                    result = list(dict.fromkeys(
+                        _onset_pri + result
+                    ))[:top_markets_count]
             # 🔒 [INCLUDE-FINAL-RESTORE-0822]
             # included_markets = 거래량/레인 순위와 무관하게 최종 MainPool에 강제 포함.
             # 단, EXCLUSION_LIST 명시 제외는 항상 우선한다.

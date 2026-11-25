@@ -2328,8 +2328,41 @@ class UnifiedTradingBot:
             )
 
             # 2) 합집합 → 중복 제거 → top_markets_count 하드캡
+            _onset_pool = []
+            try:
+                from Trading_bot_4_data import OnsetFlowBook
+                if OnsetFlowBook.enabled and self.timeframe.value == "3m":
+                    from Trading_bot_5_analysis import OnsetEngine
+                    _on_candidates = set(OnsetEngine.candidates())
+                    _on_regimes = {
+                        x.strip()
+                        for x in self.config.get(
+                            "ONSET", "regimes", fallback="ALL"
+                        ).split(",")
+                        if x.strip()
+                    }
+                    _on_regime_cache = (
+                        getattr(self.analyzer, "_stable_regime_by_symbol", None)
+                        or {}
+                    )
+                    _onset_pool = [
+                        s for s in _normal_pool
+                        if s in _on_candidates
+                        and s not in self.positions
+                        and (
+                            "ALL" in _on_regimes
+                            or _on_regime_cache.get(s) is None
+                            or getattr(
+                                _on_regime_cache.get(s), "value",
+                                str(_on_regime_cache.get(s))
+                            ) in _on_regimes
+                        )
+                    ]
+            except Exception as _on_e:
+                logger.warning(f"[ONSET] 우선 후보 조회 실패: {_on_e}")
+
             all_markets = list(dict.fromkeys(
-                _priority_pool + _normal_pool
+                _onset_pool + _priority_pool + _normal_pool
             ))[:self.top_markets_count]
             
             if not hasattr(self, "_entry_cycle_count"):
@@ -2355,6 +2388,12 @@ class UnifiedTradingBot:
                     if sym not in markets_to_check:
                         markets_to_check.insert(0, sym)
                 
+                if _onset_pool:
+                    markets_to_check = (
+                        [s for s in _onset_pool if s in markets_to_check]
+                        + [s for s in markets_to_check if s not in _onset_pool]
+                    )
+
                 # 🔒 배치 상한 유지 (API 폭증 방지)
                 if len(markets_to_check) > BATCH_SIZE:
                     markets_to_check = markets_to_check[:BATCH_SIZE]

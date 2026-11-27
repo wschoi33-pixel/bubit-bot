@@ -224,6 +224,12 @@ class UnifiedTradingBot:
         self.risk_profile = config.get_cached('risk_profile') or 'stable'
         self.max_positions = config.get_cached('max_positions') or 8
         self.risk_per_trade = config.get_cached('risk_per_trade') or 0.008
+        try:
+            self._gc_time_min = float(config.getfloat('EXIT', 'gc_time_exit_min', fallback=0.0))
+            self._gc_time_dis = float(config.getfloat('EXIT', 'gc_time_exit_disaster_pct', fallback=3.0)) / 100.0
+        except Exception:
+            self._gc_time_min, self._gc_time_dis = 0.0, 0.03
+        logger.info(f"[GC-TIME-EXIT] 설정 : {self._gc_time_min:.0f} 분 · 재난 {self._gc_time_dis * 100:.1f} % (0 = 꺼짐)")
         
         # ========================================
         # 5. 초기 잔고
@@ -1332,6 +1338,13 @@ class UnifiedTradingBot:
                         if 0.0 < _stop_price < position.avg_price
                         else _base_cap
                     )
+                    _gct_r = str(getattr(position, "entry_reason", "") or "")
+                    _gct_md = position.metadata if isinstance(getattr(position, "metadata", None), dict) else {}
+                    _gct = (self._gc_time_min > 0 and _gct_md.get("entry_type") in ("JUDGE", "TREND")
+                            and "ONSET" not in _gct_r and not _gct_md.get("recovered")
+                            and not _gct_r.startswith(("RECOVERED", "RECORD_RETRY", "LATE_FILL")))
+                    if _gct:
+                        hard_cap = self._gc_time_dis
                     loss = (
                         price - position.avg_price
                     ) / position.avg_price
@@ -1356,6 +1369,8 @@ class UnifiedTradingBot:
                         )
                         await self.execute_trade(position, signal)
                     else:
+                        if _gct:
+                            continue
                         _tp_regime = (
                             getattr(position, "entry_regime", None)
                             or MarketRegime.RANGING
@@ -1461,6 +1476,26 @@ class UnifiedTradingBot:
                         
                         await self.execute_trade(position, emergency_stop)
                         continue
+                
+                # [GC-TIME-EXIT] JUDGE/TREND 시간 청산
+                _gct_r = str(getattr(position, "entry_reason", "") or "")
+                _gct_md = position.metadata if isinstance(getattr(position, "metadata", None), dict) else {}
+                if (self._gc_time_min > 0 and _gct_md.get("entry_type") in ("JUDGE", "TREND")
+                        and "ONSET" not in _gct_r and not _gct_md.get("recovered")
+                        and not _gct_r.startswith(("RECOVERED", "RECORD_RETRY", "LATE_FILL"))):
+                    if getattr(position, "_closing", False):
+                        continue
+                    _held = (datetime.now() - position.entry_time).total_seconds() / 60.0
+                    _loss = (current_price - position.avg_price) / position.avg_price
+                    _why = None
+                    if _loss <= -self._gc_time_dis:
+                        _why = f"시간청산-재난 ({_loss * 100:.2f}%)"
+                    elif _held >= self._gc_time_min:
+                        _why = f"시간청산 {self._gc_time_min:.0f}분 ({_held:.1f}분 · {_loss * 100:+.2f}%)"
+                    if _why:
+                        logger.info(f"⏱️ [GC-TIME-EXIT] {symbol} | {_why}")
+                        await self.execute_trade(position, TradingSignal(symbol=symbol, action="SELL", price=current_price, reason=_why, confidence=1.0, sell_ratio=1.0, market_regime=MarketRegime.RANGING))
+                    continue
                 
                 # DataFrame 조회 (intrabar: 캐시 우선, 캔들 경계에서만 refresh)
                 now = time.time()
